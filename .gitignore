@@ -1,0 +1,15 @@
+# Raw warehouse extracts — place your own files under Data/ (see README)
+/Data/
+
+# Generated pipeline outputs (CSV tables); regenerate with scripts under src/
+/processed/
+
+# Model/report CSV outputs (large tabular artifacts); Markdown summaries stay tracked
+/reports/**/*.csv
+
+# Local scratch
+*.log
+
+# Python bytecode
+__pycache__/
+*.py[cod]
