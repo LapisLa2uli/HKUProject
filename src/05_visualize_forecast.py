@@ -1,18 +1,4 @@
-"""Step 5: Visualize baseline forecast results.
-
-Charts produced under ``reports/figures``:
-    11_validation_monthly_scatter.png     Monthly (wh,cust,prod) predicted vs actual scatter
-    12_april_forecast_daily.png           Apr baseline forecast daily totals
-    13_history_plus_forecast.png          Jan-Apr daily totals (history vs baseline forecast)
-    14_april_warehouse_share.png          Baseline Apr qty per warehouse
-    15_validation_error_hist.png          Monthly validation error histogram
-
-When hurdle April daily exports exist (pattern + store-cal, not network-scaled):
-    16_april_daily_baseline_vs_hurdle.png Apr daily total: baseline vs hurdle pattern vs store-cal
-    17_april_warehouse_baseline_vs_hurdle.png Top warehouses: baseline vs hurdle (pattern + store-cal)
-    18_history_baseline_hurdle_forecast.png History + Apr baseline + hurdle pattern + store-cal
-    19_april_customer_baseline_vs_hurdle.png Apr totals by customer: baseline vs hurdle (pattern + store-cal)
-"""
+"""Step 5: Visualize baseline, hurdle, and store-regression forecast results."""
 
 from __future__ import annotations
 
@@ -28,46 +14,59 @@ matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu S
 matplotlib.rcParams["axes.unicode_minus"] = False
 matplotlib.rcParams["figure.dpi"] = 110
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PROCESSED = PROJECT_ROOT / "processed"
-MARTS = PROCESSED / "marts"
-REPORTS = PROJECT_ROOT / "reports"
-FIG = REPORTS / "figures"
-FIG.mkdir(parents=True, exist_ok=True)
+_SRC = Path(__file__).resolve().parent
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
-HURDLE_PATTERN_CSV = "april_forecast_hurdle_daily_pattern.csv"
-HURDLE_STORE_CSV = "april_forecast_hurdle_daily_store.csv"
-HURDLE_NETWORK_CSV = "april_forecast_hurdle_daily.csv"
+from _report_paths import (
+    BASELINE_APRIL_DAILY,
+    BASELINE_VALIDATION_MONTHLY,
+    FIGURES,
+    HURDLE_APRIL_CALIBRATION,
+    HURDLE_APRIL_DAILY_NETWORK,
+    HURDLE_APRIL_DAILY_PATTERN,
+    HURDLE_APRIL_DAILY_STORE,
+    HURDLE_APRIL_STORE_CALIBRATION,
+    STORE_REG_APRIL_DAILY,
+    STORE_REG_VALIDATION_MONTHLY,
+    ensure_report_dirs,
+)
+from _report_paths import PROCESSED, PROJECT_ROOT
+
+MARTS = PROCESSED / "marts"
 STORE_KEYS = ["warehouse", "customer_id", "store"]
 
 
+def save(fig: plt.Figure, name: str) -> Path:
+    out = FIGURES / name
+    fig.tight_layout()
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote: {out}")
+    return out
+
+
 def load_hurdle_april_dailies() -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """Pattern and per-store-calibrated April hurdle daily (excludes network scale)."""
-    pattern_path = REPORTS / HURDLE_PATTERN_CSV
-    store_path = REPORTS / HURDLE_STORE_CSV
-    if pattern_path.exists() and store_path.exists():
-        fp = pd.read_csv(pattern_path, parse_dates=["date"])
-        fs = pd.read_csv(store_path, parse_dates=["date"])
-        return fp, fs
-
-    scaled_path = REPORTS / HURDLE_NETWORK_CSV
-    cal_path = REPORTS / "hurdle_april_calibration.csv"
-    store_cal_path = REPORTS / "hurdle_april_store_calibration.csv"
-    if not (scaled_path.exists() and cal_path.exists() and store_cal_path.exists()):
+    if HURDLE_APRIL_DAILY_PATTERN.exists() and HURDLE_APRIL_DAILY_STORE.exists():
+        return (
+            pd.read_csv(HURDLE_APRIL_DAILY_PATTERN, parse_dates=["date"]),
+            pd.read_csv(HURDLE_APRIL_DAILY_STORE, parse_dates=["date"]),
+        )
+    if not (
+        HURDLE_APRIL_DAILY_NETWORK.exists()
+        and HURDLE_APRIL_CALIBRATION.exists()
+        and HURDLE_APRIL_STORE_CALIBRATION.exists()
+    ):
         return None
-
-    print(
-        "[info] Deriving hurdle pattern/store daily from network-scaled export "
-        "(re-run 04b_hurdle_model.py to write dedicated CSVs)."
-    )
-    scaled = pd.read_csv(scaled_path, parse_dates=["date"])
-    cal = pd.read_csv(cal_path)
+    print("[info] Deriving hurdle pattern/store daily from network-scaled export.")
+    scaled = pd.read_csv(HURDLE_APRIL_DAILY_NETWORK, parse_dates=["date"])
+    cal = pd.read_csv(HURDLE_APRIL_CALIBRATION)
     ns_row = cal.loc[cal["metric"] == "april_network_scale", "value"]
     if ns_row.empty:
         ns_row = cal.loc[cal["metric"] == "april_scale", "value"]
     ns = float(ns_row.iloc[0])
     store_scales = (
-        pd.read_csv(store_cal_path)
+        pd.read_csv(HURDLE_APRIL_STORE_CALIBRATION)
         .set_index(STORE_KEYS)["store_scale"]
         .astype(np.float64)
     )
@@ -83,182 +82,282 @@ def load_hurdle_april_dailies() -> tuple[pd.DataFrame, pd.DataFrame] | None:
     return fp, fs
 
 
-def save(fig: plt.Figure, name: str) -> Path:
-    out = FIG / name
-    fig.tight_layout()
-    fig.savefig(out, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Wrote: {out}")
-    return out
+def plot_model_suite(
+    monthly: pd.DataFrame,
+    fc: pd.DataFrame,
+    wh_day: pd.DataFrame,
+    *,
+    prefix: str,
+    label: str,
+    color: str,
+) -> None:
+    _plot_history_plus_forecast(wh_day, fc, f"{label}: history + April", f"{prefix}_history_plus_forecast.png", color)
+    _plot_monthly_scatter(monthly, f"{label}: March validation scatter", f"{prefix}_validation_monthly_scatter.png")
+    _plot_april_daily_bars(fc, f"{label}: April daily total", f"{prefix}_april_forecast_daily.png", color)
+    _plot_april_warehouse_share(fc, f"{label}: top warehouses (April)", f"{prefix}_april_warehouse_share.png")
+    _plot_validation_error_hist(monthly, f"{label}: March validation errors", f"{prefix}_validation_error_hist.png")
 
 
-def main() -> int:
-    monthly = pd.read_csv(REPORTS / "baseline_validation_monthly_actual_vs_pred.csv")
-    fc = pd.read_csv(REPORTS / "april_forecast_daily.csv", parse_dates=["date"])
-    wh_day = pd.read_csv(MARTS / "mart_warehouse_day.csv", parse_dates=["create_date"])
-    wh_day = wh_day[wh_day["create_date"] <= pd.Timestamp("2026-03-28")]
-
-    fig, ax = plt.subplots(figsize=(11, 5))
-    daily_actual = wh_day.groupby("create_date")["qty_ea"].sum()
-    fig.suptitle("Daily total qty_ea: history + April forecast")
-    ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan-Mar28)", color="steelblue")
-    daily_fc = fc.groupby("date")["qty_ea"].sum()
-    ax.plot(daily_fc.index, daily_fc.values, label="forecast (Apr)", color="firebrick")
-    ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="firebrick", alpha=0.05)
-    ax.set_ylabel("qty_ea")
-    ax.set_xlabel("date")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.autofmt_xdate()
-    save(fig, "13_history_plus_forecast.png")
-
+def _plot_monthly_scatter(monthly: pd.DataFrame, title: str, fname: str) -> None:
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.scatter(monthly["actual"], monthly["pred"], alpha=0.4, s=12)
     lim = max(monthly["actual"].max(), monthly["pred"].max()) * 1.05
     ax.plot([0, lim], [0, lim], color="black", linestyle="--", linewidth=1)
     ax.set_xlim(0, lim)
     ax.set_ylim(0, lim)
-    ax.set_xlabel("March actual monthly qty_ea (per warehouse,customer,product)")
+    ax.set_xlabel("March actual monthly qty_ea")
     ax.set_ylabel("March predicted monthly qty_ea")
-    ax.set_title("Validation: monthly predicted vs actual")
+    ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    save(fig, "11_validation_monthly_scatter.png")
+    save(fig, fname)
 
-    daily_fc = fc.groupby("date")["qty_ea"].sum().reset_index()
+
+def _plot_april_daily_bars(daily_fc: pd.DataFrame, title: str, fname: str, color: str) -> None:
+    daily = daily_fc.groupby("date")["qty_ea"].sum().reset_index()
     fig, ax = plt.subplots(figsize=(11, 4.5))
-    ax.bar(daily_fc["date"], daily_fc["qty_ea"], color="firebrick", alpha=0.85)
-    ax.set_title("April forecast: daily total qty_ea")
+    ax.bar(daily["date"], daily["qty_ea"], color=color, alpha=0.85)
+    ax.set_title(title)
     ax.set_ylabel("qty_ea")
     ax.grid(True, axis="y", alpha=0.3)
     fig.autofmt_xdate()
-    save(fig, "12_april_forecast_daily.png")
+    save(fig, fname)
 
-    wh_apr = fc.groupby("warehouse")["qty_ea"].sum().sort_values(ascending=False)
-    top = wh_apr.head(15)
+
+def _plot_history_plus_forecast(
+    wh_day: pd.DataFrame,
+    daily_fc: pd.DataFrame,
+    title: str,
+    fname: str,
+    color: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(11, 5))
+    daily_actual = wh_day.groupby("create_date")["qty_ea"].sum()
+    daily_pred = daily_fc.groupby("date")["qty_ea"].sum()
+    ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan–Mar 28)", color="steelblue")
+    ax.plot(daily_pred.index, daily_pred.values, label="forecast (Apr)", color=color)
+    ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color=color, alpha=0.05)
+    ax.set_ylabel("qty_ea")
+    ax.set_xlabel("date")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    save(fig, fname)
+
+
+def _plot_april_warehouse_share(fc: pd.DataFrame, title: str, fname: str) -> None:
+    wh_apr = fc.groupby("warehouse")["qty_ea"].sum().sort_values(ascending=False).head(15)
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.barh(top.index[::-1], top.values[::-1], color="darkcyan")
-    ax.set_title("Top 15 warehouses by April predicted qty_ea")
+    ax.barh(wh_apr.index[::-1], wh_apr.values[::-1], color="darkcyan")
+    ax.set_title(title)
     ax.set_xlabel("predicted qty_ea")
     ax.grid(True, axis="x", alpha=0.3)
-    save(fig, "14_april_warehouse_share.png")
+    save(fig, fname)
 
-    monthly = monthly.copy()
-    monthly["error"] = monthly["pred"] - monthly["actual"]
+
+def _plot_validation_error_hist(monthly: pd.DataFrame, title: str, fname: str) -> None:
+    err = monthly.copy()
+    err["error"] = err["pred"] - err["actual"]
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.hist(monthly["error"], bins=60, color="slategray")
+    ax.hist(err["error"], bins=60, color="slategray")
     ax.axvline(0, color="black", linestyle="--")
-    ax.set_title("Validation error distribution: predicted - actual (monthly per tuple)")
+    ax.set_title(title)
     ax.set_xlabel("error (qty_ea)")
     ax.set_ylabel("count")
     ax.grid(True, alpha=0.3)
-    save(fig, "15_validation_error_hist.png")
+    save(fig, fname)
 
-    hurdle = load_hurdle_april_dailies()
-    if hurdle is None:
-        print("[skip] No hurdle pattern/store daily exports; skipping comparative charts.")
-        return 0
 
-    fh_pattern, fh_store = hurdle
+def plot_multi_model_comparison(
+    fc: pd.DataFrame,
+    fh_pattern: pd.DataFrame,
+    fh_store: pd.DataFrame,
+    fs_reg: pd.DataFrame,
+    wh_day: pd.DataFrame,
+) -> None:
     daily_b = fc.groupby("date")["qty_ea"].sum().sort_index()
     daily_hp = fh_pattern.groupby("date")["qty_ea"].sum().sort_index()
     daily_hs = fh_store.groupby("date")["qty_ea"].sum().sort_index()
+    daily_sr = fs_reg.groupby("date")["qty_ea"].sum().sort_index()
+    daily_actual = wh_day.groupby("create_date")["qty_ea"].sum()
 
-    fig, ax = plt.subplots(figsize=(11, 5))
-    ax.plot(daily_b.index, daily_b.values, label="baseline", color="firebrick", linewidth=2)
-    ax.plot(
-        daily_hp.index,
-        daily_hp.values,
-        label="hurdle pattern (Apr)",
-        color="goldenrod",
-        linewidth=2,
-    )
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan–Mar 28)", color="steelblue", linewidth=2)
+    ax.plot(daily_b.index, daily_b.values, label="baseline (Apr)", color="firebrick", linewidth=2)
+    ax.plot(daily_hp.index, daily_hp.values, label="hurdle pattern (Apr)", color="goldenrod", linewidth=1.8)
     ax.plot(
         daily_hs.index,
         daily_hs.values,
         label="hurdle store-cal (Apr)",
         color="darkorange",
-        linewidth=2,
+        linewidth=1.8,
         linestyle="--",
     )
+    ax.plot(
+        daily_sr.index,
+        daily_sr.values,
+        label="store regression (Apr)",
+        color="seagreen",
+        linewidth=2,
+    )
     ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="gray", alpha=0.06)
-    ax.set_title("April forecast: daily total qty_ea — baseline vs hurdle (pattern + store-cal)")
+    ax.set_title("April daily total qty_ea — all models")
     ax.set_ylabel("qty_ea")
     ax.set_xlabel("date")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    save(fig, "16_april_daily_all_models.png")
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan–Mar 28)", color="steelblue")
+    ax.plot(daily_b.index, daily_b.values, label="baseline (Apr)", color="firebrick")
+    ax.plot(daily_hp.index, daily_hp.values, label="hurdle pattern (Apr)", color="goldenrod")
+    ax.plot(daily_hs.index, daily_hs.values, label="hurdle store-cal (Apr)", color="darkorange", linestyle="--")
+    ax.plot(daily_sr.index, daily_sr.values, label="store regression (Apr)", color="seagreen")
+    ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="gray", alpha=0.06)
+    ax.set_title("Daily total qty_ea: history + April forecasts (all models)")
+    ax.set_ylabel("qty_ea")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.autofmt_xdate()
+    save(fig, "18_history_all_models_forecast.png")
+
+    wh_b = fc.groupby("warehouse")["qty_ea"].sum()
+    wh_p = fh_pattern.groupby("warehouse")["qty_ea"].sum()
+    wh_s = fh_store.groupby("warehouse")["qty_ea"].sum()
+    wh_r = fs_reg.groupby("warehouse")["qty_ea"].sum()
+    wh_cmp = pd.DataFrame(
+        {
+            "baseline": wh_b,
+            "hurdle_pattern": wh_p,
+            "hurdle_store": wh_s,
+            "store_regression": wh_r,
+        }
+    ).fillna(0)
+    wh_cmp["max_pair"] = wh_cmp.max(axis=1)
+    top_wh = wh_cmp.nlargest(15, "max_pair").sort_values("baseline")
+    y = np.arange(len(top_wh))
+    h = 0.18
+    fig, ax = plt.subplots(figsize=(11, 7))
+    ax.barh(y - 1.5 * h, top_wh["baseline"], height=h, label="baseline", color="firebrick", alpha=0.85)
+    ax.barh(y - 0.5 * h, top_wh["hurdle_pattern"], height=h, label="hurdle pattern", color="goldenrod", alpha=0.85)
+    ax.barh(y + 0.5 * h, top_wh["hurdle_store"], height=h, label="hurdle store-cal", color="darkorange", alpha=0.85)
+    ax.barh(y + 1.5 * h, top_wh["store_regression"], height=h, label="store regression", color="seagreen", alpha=0.85)
+    ax.set_yticks(y)
+    ax.set_yticklabels(top_wh.index)
+    ax.set_xlabel("predicted qty_ea (April)")
+    ax.set_title("Top 15 warehouses: April totals — all models")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="x", alpha=0.3)
+    save(fig, "17_april_warehouse_all_models.png")
+
+    cust_b = fc.groupby("customer_id")["qty_ea"].sum()
+    cust_p = fh_pattern.groupby("customer_id")["qty_ea"].sum()
+    cust_s = fh_store.groupby("customer_id")["qty_ea"].sum()
+    cust_r = fs_reg.groupby("customer_id")["qty_ea"].sum()
+    cust_cmp = (
+        pd.DataFrame(
+            {
+                "baseline": cust_b,
+                "hurdle_pattern": cust_p,
+                "hurdle_store": cust_s,
+                "store_regression": cust_r,
+            }
+        )
+        .fillna(0)
+        .sort_index()
+    )
+    x = np.arange(len(cust_cmp))
+    w = 0.18
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(x - 1.5 * w, cust_cmp["baseline"], width=w, label="baseline", color="firebrick", alpha=0.85)
+    ax.bar(x - 0.5 * w, cust_cmp["hurdle_pattern"], width=w, label="hurdle pattern", color="goldenrod", alpha=0.85)
+    ax.bar(x + 0.5 * w, cust_cmp["hurdle_store"], width=w, label="hurdle store-cal", color="darkorange", alpha=0.85)
+    ax.bar(x + 1.5 * w, cust_cmp["store_regression"], width=w, label="store regression", color="seagreen", alpha=0.85)
+    ax.set_xticks(x)
+    ax.set_xticklabels(cust_cmp.index)
+    ax.set_ylabel("predicted qty_ea (April)")
+    ax.set_title("April totals by customer — all models")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=0.3)
+    save(fig, "19_april_customer_all_models.png")
+
+    # Keep legacy filenames for baseline vs hurdle (without store reg) for backward compatibility
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.plot(daily_b.index, daily_b.values, label="baseline", color="firebrick", linewidth=2)
+    ax.plot(daily_hp.index, daily_hp.values, label="hurdle pattern", color="goldenrod", linewidth=2)
+    ax.plot(daily_hs.index, daily_hs.values, label="hurdle store-cal", color="darkorange", linestyle="--", linewidth=2)
+    ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="gray", alpha=0.06)
+    ax.set_title("April forecast: daily total — baseline vs hurdle")
+    ax.set_ylabel("qty_ea")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.autofmt_xdate()
     save(fig, "16_april_daily_baseline_vs_hurdle.png")
 
-    wh_b = fc.groupby("warehouse")["qty_ea"].sum()
-    wh_p = fh_pattern.groupby("warehouse")["qty_ea"].sum()
-    wh_s = fh_store.groupby("warehouse")["qty_ea"].sum()
-    wh_cmp = pd.DataFrame({"baseline": wh_b, "hurdle_pattern": wh_p, "hurdle_store": wh_s}).fillna(0)
-    wh_cmp["max_pair"] = wh_cmp.max(axis=1)
-    top_wh = wh_cmp.nlargest(15, "max_pair").sort_values("baseline")
 
-    fig, ax = plt.subplots(figsize=(10, 7))
-    y = np.arange(len(top_wh))
-    h = 0.24
-    ax.barh(y - h, top_wh["baseline"], height=h, label="baseline", color="firebrick", alpha=0.85)
-    ax.barh(y, top_wh["hurdle_pattern"], height=h, label="hurdle pattern", color="goldenrod", alpha=0.85)
-    ax.barh(y + h, top_wh["hurdle_store"], height=h, label="hurdle store-cal", color="darkorange", alpha=0.85)
-    ax.set_yticks(y)
-    ax.set_yticklabels(top_wh.index)
-    ax.set_xlabel("predicted qty_ea (April)")
-    ax.set_title("Top 15 warehouses: April predicted qty — baseline vs hurdle (pattern + store-cal)")
-    ax.legend()
-    ax.grid(True, axis="x", alpha=0.3)
-    save(fig, "17_april_warehouse_baseline_vs_hurdle.png")
+def main() -> int:
+    ensure_report_dirs()
 
-    fig, ax = plt.subplots(figsize=(11, 5))
-    ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan–Mar 28)", color="steelblue")
-    ax.plot(daily_b.index, daily_b.values, label="forecast baseline (Apr)", color="firebrick", linestyle="-")
-    ax.plot(
-        daily_hp.index,
-        daily_hp.values,
-        label="forecast hurdle pattern (Apr)",
-        color="goldenrod",
-        linestyle="-",
+    if not BASELINE_VALIDATION_MONTHLY.exists() or not BASELINE_APRIL_DAILY.exists():
+        print("Missing baseline reports; run 04_baseline_model.py first.", file=sys.stderr)
+        return 1
+
+    monthly_b = pd.read_csv(BASELINE_VALIDATION_MONTHLY)
+    fc_b = pd.read_csv(BASELINE_APRIL_DAILY, parse_dates=["date"])
+    wh_day = pd.read_csv(MARTS / "mart_warehouse_day.csv", parse_dates=["create_date"])
+    wh_day = wh_day[wh_day["create_date"] <= pd.Timestamp("2026-03-28")]
+
+    _plot_history_plus_forecast(
+        wh_day, fc_b, "Daily total qty_ea: history + April forecast (baseline)",
+        "13_history_plus_forecast.png", "firebrick",
     )
-    ax.plot(
-        daily_hs.index,
-        daily_hs.values,
-        label="forecast hurdle store-cal (Apr)",
-        color="darkorange",
-        linestyle="--",
+    _plot_monthly_scatter(
+        monthly_b, "Validation: monthly predicted vs actual (baseline)",
+        "11_validation_monthly_scatter.png",
     )
-    ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="gray", alpha=0.06)
-    ax.set_title("Daily total qty_ea: history + April forecasts")
-    ax.set_ylabel("qty_ea")
-    ax.set_xlabel("date")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.autofmt_xdate()
-    save(fig, "18_history_baseline_hurdle_forecast.png")
+    _plot_april_daily_bars(fc_b, "April forecast: daily total qty_ea (baseline)", "12_april_forecast_daily.png", "firebrick")
+    _plot_april_warehouse_share(fc_b, "Top 15 warehouses by April predicted qty_ea (baseline)", "14_april_warehouse_share.png")
+    _plot_validation_error_hist(monthly_b, "Validation error distribution (baseline)", "15_validation_error_hist.png")
 
-    cust_b = fc.groupby("customer_id")["qty_ea"].sum()
-    cust_p = fh_pattern.groupby("customer_id")["qty_ea"].sum()
-    cust_s = fh_store.groupby("customer_id")["qty_ea"].sum()
-    cust_cmp = (
-        pd.DataFrame({"baseline": cust_b, "hurdle_pattern": cust_p, "hurdle_store": cust_s})
-        .fillna(0)
-        .sort_index()
-    )
+    if STORE_REG_VALIDATION_MONTHLY.exists() and STORE_REG_APRIL_DAILY.exists():
+        monthly_sr = pd.read_csv(STORE_REG_VALIDATION_MONTHLY)
+        fc_sr = pd.read_csv(STORE_REG_APRIL_DAILY, parse_dates=["date"])
+        _plot_history_plus_forecast(
+            wh_day, fc_sr, "Store regression: history + April",
+            "29_store_regression_history_plus_forecast.png", "seagreen",
+        )
+        _plot_monthly_scatter(
+            monthly_sr, "Store regression: March validation scatter",
+            "27_store_regression_validation_monthly_scatter.png",
+        )
+        _plot_april_daily_bars(
+            fc_sr, "Store regression: April daily total",
+            "28_store_regression_april_forecast_daily.png", "seagreen",
+        )
+        _plot_april_warehouse_share(
+            fc_sr, "Store regression: top warehouses (April)",
+            "30_store_regression_april_warehouse_share.png",
+        )
+        _plot_validation_error_hist(
+            monthly_sr, "Store regression: March validation errors",
+            "31_store_regression_validation_error_hist.png",
+        )
+    else:
+        print("[skip] Store regression CSVs missing; run 04c_store_regression_model.py")
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    x = np.arange(len(cust_cmp))
-    w = 0.25
-    ax.bar(x - w, cust_cmp["baseline"], width=w, label="baseline", color="firebrick", alpha=0.85)
-    ax.bar(x, cust_cmp["hurdle_pattern"], width=w, label="hurdle pattern", color="goldenrod", alpha=0.85)
-    ax.bar(x + w, cust_cmp["hurdle_store"], width=w, label="hurdle store-cal", color="darkorange", alpha=0.85)
-    ax.set_xticks(x)
-    ax.set_xticklabels(cust_cmp.index)
-    ax.set_xlabel("customer_id")
-    ax.set_ylabel("predicted qty_ea (April)")
-    ax.set_title("April predicted totals by customer — baseline vs hurdle (pattern + store-cal)")
-    ax.legend()
-    ax.grid(True, axis="y", alpha=0.3)
-    save(fig, "19_april_customer_baseline_vs_hurdle.png")
+    hurdle = load_hurdle_april_dailies()
+    if hurdle is None:
+        print("[skip] Hurdle daily exports missing; skipping multi-model charts.")
+        return 0
+
+    fh_pattern, fh_store = hurdle
+    if STORE_REG_APRIL_DAILY.exists():
+        fs_reg = pd.read_csv(STORE_REG_APRIL_DAILY, parse_dates=["date"])
+        plot_multi_model_comparison(fc_b, fh_pattern, fh_store, fs_reg, wh_day)
+    else:
+        print("[skip] Multi-model comparison needs store regression April daily.")
 
     return 0
 

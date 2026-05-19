@@ -40,11 +40,28 @@ from _metrics import (
     wmape,
 )
 
+from _report_paths import (
+    HURDLE_APRIL_CALIBRATION,
+    HURDLE_APRIL_DAILY_NETWORK,
+    HURDLE_APRIL_DAILY_PATTERN,
+    HURDLE_APRIL_DAILY_STORE,
+    HURDLE_APRIL_MONTHLY_CP,
+    HURDLE_APRIL_MONTHLY_STORE,
+    HURDLE_APRIL_MONTHLY_WCP,
+    HURDLE_APRIL_MONTHLY_WH,
+    HURDLE_APRIL_STORE_CALIBRATION,
+    HURDLE_VALIDATION_CLASSIFIER,
+    HURDLE_VALIDATION_INTERMITTENT,
+    HURDLE_VALIDATION_MONTHLY,
+    HURDLE_VALIDATION_OVERALL,
+    HURDLE_VALIDATION_PER_CUSTOMER,
+    HURDLE_VALIDATION_PER_WAREHOUSE,
+    ensure_report_dirs,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = PROJECT_ROOT / "processed"
 MARTS = PROCESSED / "marts"
-REPORTS = PROJECT_ROOT / "reports"
-REPORTS.mkdir(parents=True, exist_ok=True)
 
 TRAIN_END = pd.Timestamp("2026-02-28")
 VALID_START = pd.Timestamp("2026-03-01")
@@ -93,9 +110,9 @@ STORE_CALIBRATION_CLIP_LO = 0.15
 STORE_CALIBRATION_CLIP_HI = 3.5
 
 # April daily exports (visualization uses pattern + store-cal, not network-scaled).
-HURDLE_DAILY_PATTERN_CSV = "april_forecast_hurdle_daily_pattern.csv"
-HURDLE_DAILY_STORE_CSV = "april_forecast_hurdle_daily_store.csv"
-HURDLE_DAILY_NETWORK_CSV = "april_forecast_hurdle_daily.csv"
+HURDLE_DAILY_PATTERN_CSV = HURDLE_APRIL_DAILY_PATTERN.name
+HURDLE_DAILY_STORE_CSV = HURDLE_APRIL_DAILY_STORE.name
+HURDLE_DAILY_NETWORK_CSV = HURDLE_APRIL_DAILY_NETWORK.name
 
 
 def write_hurdle_daily_csv(
@@ -995,6 +1012,7 @@ def recursive_forecast(
 def main() -> int:
     global P_ORDER_BLEND_LAMBDA, P_ORDER_PRIOR_K
 
+    ensure_report_dirs()
     log("Loading store-level mart...")
     raw = load_panel_base()
 
@@ -1107,7 +1125,7 @@ def main() -> int:
         if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
     ]
     pd.DataFrame(iloss_rows).to_csv(
-        REPORTS / "hurdle_validation_intermittent_loss.csv", index=False, encoding="utf-8-sig"
+        HURDLE_VALIDATION_INTERMITTENT, index=False, encoding="utf-8-sig"
     )
 
     per_wh = diag.groupby("warehouse", observed=True)[["qty_ea", "pred"]].apply(
@@ -1143,13 +1161,11 @@ def main() -> int:
     log(f"  monthly WMAPE={wmape_m:.4f}  bias_ratio={bias_m:+.4f}")
 
     pd.DataFrame([clf_metrics]).to_csv(
-        REPORTS / "hurdle_validation_classifier.csv", index=False, encoding="utf-8-sig"
+        HURDLE_VALIDATION_CLASSIFIER, index=False, encoding="utf-8-sig"
     )
-    per_wh.to_csv(REPORTS / "hurdle_validation_per_warehouse.csv", index=False, encoding="utf-8-sig")
-    per_cust.to_csv(REPORTS / "hurdle_validation_per_customer.csv", index=False, encoding="utf-8-sig")
-    monthly.to_csv(
-        REPORTS / "hurdle_validation_monthly_actual_vs_pred.csv", index=False, encoding="utf-8-sig"
-    )
+    per_wh.to_csv(HURDLE_VALIDATION_PER_WAREHOUSE, index=False, encoding="utf-8-sig")
+    per_cust.to_csv(HURDLE_VALIDATION_PER_CUSTOMER, index=False, encoding="utf-8-sig")
+    monthly.to_csv(HURDLE_VALIDATION_MONTHLY, index=False, encoding="utf-8-sig")
     cal_rows = [
         {"metric": f"daily_{k}", "value": v} for k, v in overall.items()
     ] + [{"metric": f"monthly_{k}", "value": v} for k, v in monthly_overall.items()]
@@ -1188,7 +1204,7 @@ def main() -> int:
         {"metric": "P_order_prior_k", "value": P_ORDER_PRIOR_K},
     ]
     pd.DataFrame(cal_rows).to_csv(
-        REPORTS / "hurdle_validation_overall.csv", index=False, encoding="utf-8-sig"
+        HURDLE_VALIDATION_OVERALL, index=False, encoding="utf-8-sig"
     )
 
     log("Retraining on Jan-Mar...")
@@ -1227,7 +1243,7 @@ def main() -> int:
         f"Q_after_store={q_apr_store:,.1f}"
     )
     store_cal_diag.to_csv(
-        REPORTS / "hurdle_april_store_calibration.csv", index=False, encoding="utf-8-sig"
+        HURDLE_APRIL_STORE_CALIBRATION, index=False, encoding="utf-8-sig"
     )
 
     apr1_soften_scale = 1.0
@@ -1243,9 +1259,9 @@ def main() -> int:
 
     name_lookup = panel[ID_COLS + ["product_name", "temperature_zone"]].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
-    write_hurdle_daily_csv(daily_fc_pattern, REPORTS / HURDLE_DAILY_PATTERN_CSV, name_lookup)
-    write_hurdle_daily_csv(daily_fc_store, REPORTS / HURDLE_DAILY_STORE_CSV, name_lookup)
-    write_hurdle_daily_csv(daily_fc, REPORTS / HURDLE_DAILY_NETWORK_CSV, name_lookup)
+    write_hurdle_daily_csv(daily_fc_pattern, HURDLE_APRIL_DAILY_PATTERN, name_lookup)
+    write_hurdle_daily_csv(daily_fc_store, HURDLE_APRIL_DAILY_STORE, name_lookup)
+    write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_NETWORK, name_lookup)
     log(
         f"  Wrote April daily: {HURDLE_DAILY_PATTERN_CSV}, {HURDLE_DAILY_STORE_CSV}, "
         f"{HURDLE_DAILY_NETWORK_CSV} (network-scaled)"
@@ -1274,7 +1290,7 @@ def main() -> int:
             {"metric": "P_order_blend_lambda", "value": P_ORDER_BLEND_LAMBDA},
             {"metric": "P_order_prior_k", "value": P_ORDER_PRIOR_K},
         ]
-    ).to_csv(REPORTS / "hurdle_april_calibration.csv", index=False, encoding="utf-8-sig")
+    ).to_csv(HURDLE_APRIL_CALIBRATION, index=False, encoding="utf-8-sig")
 
     monthly_wcp = (
         daily_fc.groupby(["warehouse", "customer_id", "product_id", "product_name", "temperature_zone"])[
@@ -1285,9 +1301,7 @@ def main() -> int:
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
     monthly_wcp.to_csv(
-        REPORTS / "april_forecast_hurdle_monthly_by_warehouse_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
+        HURDLE_APRIL_MONTHLY_WCP, index=False, encoding="utf-8-sig"
     )
 
     monthly_store = (
@@ -1296,11 +1310,7 @@ def main() -> int:
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
-    monthly_store.to_csv(
-        REPORTS / "april_forecast_hurdle_monthly_by_store_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    monthly_store.to_csv(HURDLE_APRIL_MONTHLY_STORE, index=False, encoding="utf-8-sig")
 
     monthly_cp = (
         daily_fc.groupby(["customer_id", "product_id", "product_name", "temperature_zone"])["qty_ea"]
@@ -1308,11 +1318,7 @@ def main() -> int:
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
-    monthly_cp.to_csv(
-        REPORTS / "april_forecast_hurdle_monthly_by_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    monthly_cp.to_csv(HURDLE_APRIL_MONTHLY_CP, index=False, encoding="utf-8-sig")
 
     monthly_wh = (
         daily_fc.groupby("warehouse")["qty_ea"]
@@ -1321,9 +1327,7 @@ def main() -> int:
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
         .sort_values("predicted_qty_ea_april", ascending=False)
     )
-    monthly_wh.to_csv(
-        REPORTS / "april_forecast_hurdle_monthly_by_warehouse.csv", index=False, encoding="utf-8-sig"
-    )
+    monthly_wh.to_csv(HURDLE_APRIL_MONTHLY_WH, index=False, encoding="utf-8-sig")
 
     log("Done.")
     log(

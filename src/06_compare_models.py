@@ -13,39 +13,52 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from _metrics import bias_ratio, wmape
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPORTS = PROJECT_ROOT / "reports"
+from _report_paths import (
+    BASELINE_APRIL_MONTHLY_WCP,
+    BASELINE_VALIDATION_MONTHLY,
+    BASELINE_VALIDATION_OVERALL,
+    COMPARISON_APRIL_CP,
+    COMPARISON_APRIL_CUST,
+    COMPARISON_APRIL_WH,
+    COMPARISON_APRIL_WCP,
+    COMPARISON_CSV,
+    COMPARISON_MD,
+    HURDLE_APRIL_DAILY_NETWORK,
+    HURDLE_VALIDATION_MONTHLY,
+    HURDLE_VALIDATION_OVERALL,
+    STORE_REG_APRIL_DAILY,
+    STORE_REG_VALIDATION_MONTHLY,
+    STORE_REG_VALIDATION_OVERALL,
+    ensure_report_dirs,
+)
 
 # Documented pre-CNY-handling baseline bias ratio (March monthly total)
 BASELINE_BIAS_RATIO_PRE_CNY = -0.187
 
 
 def load_baseline_march() -> tuple[pd.DataFrame, dict[str, float]]:
-    monthly = pd.read_csv(REPORTS / "baseline_validation_monthly_actual_vs_pred.csv")
-    overall_df = pd.read_csv(REPORTS / "baseline_validation_overall.csv")
+    monthly = pd.read_csv(BASELINE_VALIDATION_MONTHLY)
+    overall_df = pd.read_csv(BASELINE_VALIDATION_OVERALL)
     keys = overall_df.set_index("metric")["value"].to_dict()
     return monthly, keys
 
 
 def load_hurdle_march() -> tuple[pd.DataFrame, dict[str, float]]:
-    monthly = pd.read_csv(REPORTS / "hurdle_validation_monthly_actual_vs_pred.csv")
-    overall_df = pd.read_csv(REPORTS / "hurdle_validation_overall.csv")
+    monthly = pd.read_csv(HURDLE_VALIDATION_MONTHLY)
+    overall_df = pd.read_csv(HURDLE_VALIDATION_OVERALL)
     keys = overall_df.set_index("metric")["value"].to_dict()
     return monthly, keys
 
 
 def load_store_regression_march() -> tuple[pd.DataFrame, dict[str, float]]:
-    monthly = pd.read_csv(
-        REPORTS / "store_regression_validation_monthly_actual_vs_pred.csv"
-    )
-    overall_df = pd.read_csv(REPORTS / "store_regression_validation_overall.csv")
+    monthly = pd.read_csv(STORE_REG_VALIDATION_MONTHLY)
+    overall_df = pd.read_csv(STORE_REG_VALIDATION_OVERALL)
     keys = overall_df.set_index("metric")["value"].to_dict()
     return monthly, keys
 
 
 def rollup_hurdle_april() -> pd.DataFrame:
-    daily = pd.read_csv(REPORTS / "april_forecast_hurdle_daily.csv", parse_dates=["date"])
+    daily = pd.read_csv(HURDLE_APRIL_DAILY_NETWORK, parse_dates=["date"])
     return (
         daily.groupby(["warehouse", "customer_id", "product_id"], as_index=False)["qty_ea"]
         .sum()
@@ -54,9 +67,7 @@ def rollup_hurdle_april() -> pd.DataFrame:
 
 
 def rollup_store_regression_april() -> pd.DataFrame:
-    daily = pd.read_csv(
-        REPORTS / "april_forecast_store_regression_daily.csv", parse_dates=["date"]
-    )
+    daily = pd.read_csv(STORE_REG_APRIL_DAILY, parse_dates=["date"])
     return (
         daily.groupby(["warehouse", "customer_id", "product_id"], as_index=False)["qty_ea"]
         .sum()
@@ -65,14 +76,12 @@ def rollup_store_regression_april() -> pd.DataFrame:
 
 
 def load_baseline_april_wcp() -> pd.DataFrame:
-    df = pd.read_csv(REPORTS / "april_forecast_monthly_by_warehouse_customer_product.csv")
-    return df.rename(
-        columns={"predicted_qty_ea_april": "baseline_predicted_qty_ea_april"}
-    )
+    df = pd.read_csv(BASELINE_APRIL_MONTHLY_WCP)
+    return df.rename(columns={"predicted_qty_ea_april": "baseline_predicted_qty_ea_april"})
 
 
 def main() -> int:
-    REPORTS.mkdir(parents=True, exist_ok=True)
+    ensure_report_dirs()
 
     base_m, base_keys = load_baseline_march()
     hur_m, hur_keys = load_hurdle_march()
@@ -124,9 +133,7 @@ def main() -> int:
         - cmp_apr["baseline_predicted_qty_ea_april"]
     )
     denom = cmp_apr["baseline_predicted_qty_ea_april"].replace(0, np.nan)
-    cmp_apr["pct_diff_hurdle_vs_baseline"] = (
-        100.0 * cmp_apr["diff_hurdle_vs_baseline"] / denom
-    )
+    cmp_apr["pct_diff_hurdle_vs_baseline"] = 100.0 * cmp_apr["diff_hurdle_vs_baseline"] / denom
 
     model_cols = [
         "baseline_predicted_qty_ea_april",
@@ -189,27 +196,23 @@ def main() -> int:
             "value": float(cmp_apr["store_regression_predicted_qty_ea_april"].sum()),
         },
     ]
-    pd.DataFrame(summary_rows).to_csv(
-        REPORTS / "model_comparison.csv", index=False, encoding="utf-8-sig"
-    )
-    cmp_apr.to_csv(
-        REPORTS / "model_comparison_april_by_warehouse_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    wh_apr.to_csv(
-        REPORTS / "model_comparison_april_by_warehouse.csv", index=False, encoding="utf-8-sig"
-    )
-    cust_apr.to_csv(
-        REPORTS / "model_comparison_april_by_customer.csv", index=False, encoding="utf-8-sig"
-    )
-    cp_apr.to_csv(
-        REPORTS / "model_comparison_april_by_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    pd.DataFrame(summary_rows).to_csv(COMPARISON_CSV, index=False, encoding="utf-8-sig")
+    cmp_apr.to_csv(COMPARISON_APRIL_WCP, index=False, encoding="utf-8-sig")
+    wh_apr.to_csv(COMPARISON_APRIL_WH, index=False, encoding="utf-8-sig")
+    cust_apr.to_csv(COMPARISON_APRIL_CUST, index=False, encoding="utf-8-sig")
+    cp_apr.to_csv(COMPARISON_APRIL_CP, index=False, encoding="utf-8-sig")
 
     md = f"""# Model comparison (baseline vs hurdle vs store regression)
+
+This file is generated by `src/06_compare_models.py`. Term definitions: [docs/modeling_glossary.md](../docs/modeling_glossary.md).
+
+## How to read the tables
+
+- **March validation** compares models to **known** March actuals. The models were trained on January–February only for this check (see main README).
+- **Daily MAE** (mean absolute error): average \|actual − predicted\| in **units** (`qty_ea`) across open March days. Lower is better.
+- **Monthly WMAPE**: error on **March monthly totals** per series, expressed as a fraction of total actual demand. Lower is better. Useful when you care about total volume more than exact day-by-day timing.
+- **Bias ratio** (baseline): `sum(predicted) / sum(actual)` on March monthly totals. **1.00** = right total level; **1.05** ≈ 5% over-forecast.
+- **April totals**: sum of all April daily predictions (hurdle and store regression are rolled up to warehouse–customer–product so they are comparable to baseline). There are **no April actuals** in the repo for automatic scoring.
 
 ## March validation
 
@@ -232,10 +235,18 @@ def main() -> int:
 | Hurdle (rolled up) | {cmp_apr['hurdle_predicted_qty_ea_april'].sum():,.0f} |
 | Store regression (rolled up) | {cmp_apr['store_regression_predicted_qty_ea_april'].sum():,.0f} |
 
-See `model_comparison.csv` and `model_comparison_april_*.csv`.
+## Detail files
+
+| File | Contents |
+|------|----------|
+| `comparison/model_comparison.csv` | One row per summary metric |
+| `comparison/model_comparison_april_by_warehouse_customer_product.csv` | April predictions by series, all models |
+| `comparison/model_comparison_april_by_warehouse.csv` | April totals by warehouse |
+| `comparison/model_comparison_april_by_customer.csv` | April totals by customer |
+| `comparison/model_comparison_april_by_customer_product.csv` | April totals by customer × product |
 """
-    (REPORTS / "model_comparison.md").write_text(md, encoding="utf-8")
-    print("Wrote reports/model_comparison.md and related CSVs.")
+    COMPARISON_MD.write_text(md, encoding="utf-8")
+    print(f"Wrote {COMPARISON_MD.relative_to(COMPARISON_MD.parents[1])} and comparison CSVs.")
     return 0
 
 

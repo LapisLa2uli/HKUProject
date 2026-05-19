@@ -67,15 +67,40 @@ python src/06_compare_models.py
 Outputs:
 
 - **`processed/`** — canonical CSVs (`orders.csv`, `order_items.csv`, …) and `processed/marts/` aggregates used by models.  
-- **`reports/`** — Markdown summaries (tracked), CSV metric tables (ignored by Git), and PNG figures under `reports/figures/`.
+- **`reports/`** — see [reports/README.md](reports/README.md) for layout:
+  - `baseline/`, `hurdle/`, `store_regression/` — model CSV outputs (gitignored)
+  - `comparison/` — cross-model tables
+  - `heatmaps/` — heatmap row-order metadata
+  - `figures/` — PNG charts (validation, April forecasts, comparisons, store heatmaps)
+  - `baseline_report.md`, `model_comparison.md` — summaries at `reports/` root
 
 Optional debugging utilities live under `scripts/`.
+
+**Documentation:** [docs/modeling_glossary.md](docs/modeling_glossary.md) explains forecasting terms for readers with basic math background. [reports/README.md](reports/README.md) describes output folders and figure numbers.
 
 ---
 
 ## Model methodology
 
 This section documents how data are split, how features are built, and how the baseline, hurdle, and store regression models train, validate, and forecast. Implementation lives in `src/04_baseline_model.py`, `src/04b_hurdle_model.py`, `src/04c_store_regression_model.py`, and shared helpers in `src/_cny.py` and `src/_metrics.py`.
+
+**Audience:** If you are new to forecasting or machine learning, read [docs/modeling_glossary.md](docs/modeling_glossary.md) first. It defines terms such as *grain*, *dense panel*, *MAE*, *Poisson regression*, *hurdle model*, and *pattern forecast* in plain language. The subsections below use those ideas but focus on what this repository actually does.
+
+### Concepts in brief
+
+| Idea | What it means here |
+|------|---------------------|
+| **Target** | Daily **`qty_ea`** (quantity in “each” units) for a fixed grain (see table below). |
+| **Grain / tuple** | The keys that define one time series—for example one warehouse + one store + one product. |
+| **Dense panel** | Every calendar day gets a row; days without an order have quantity **0**. |
+| **Training** | Fit the model on **January–February** actuals. |
+| **Validation** | Score the model on **March** actuals (March not used when fitting the validation run). |
+| **Forecast** | Predict **April**; the repo has no April actuals for automatic scoring. |
+| **Baseline** | One model predicts quantity every day; April uses **recursive** updates (yesterday’s prediction becomes an input for today). |
+| **Hurdle** | Two models: “order day?” × “how large if ordered?”; April uses **pattern scheduling** plus optional level **calibration**. |
+| **Store regression** | March: similar to baseline at store grain; April (default): same **pattern scheduling** as hurdle, without calibration layers. |
+
+**Metrics (validation):** **MAE** = average absolute error in units; **WMAPE** = total error ÷ total actual (good for monthly totals); **bias ratio** = predicted total ÷ actual total (1.0 is ideal). See the glossary for SMAPE, RMSE, and when SMAPE is misleading on sparse data.
 
 ### Pipeline overview
 
@@ -104,7 +129,7 @@ flowchart LR
 
 ### Calendar splits and what counts as “test”
 
-Both models use the **same date constants** (`TRAIN_END`, `VALID_START`, `VALID_END`, `FORECAST_START`, `FORECAST_END`, `HISTORY_END`) defined at the top of `src/04_baseline_model.py` and `src/04b_hurdle_model.py`.
+All three models use the **same date constants** (`TRAIN_END`, `VALID_START`, `VALID_END`, `FORECAST_START`, `FORECAST_END`, `HISTORY_END`) at the top of `src/04_baseline_model.py`, `src/04b_hurdle_model.py`, and `src/04c_store_regression_model.py`.
 
 | Role | Dates | Used for |
 |------|--------|----------|
@@ -113,28 +138,31 @@ Both models use the **same date constants** (`TRAIN_END`, `VALID_START`, `VALID_
 | **History end** | Same as validation end (`HISTORY_END = VALID_END`) | Building dense panels through the last observed day |
 | **Forecast** | **2026-04-01** through **2026-04-30** | Forward April prediction |
 
-**There is no separate labeled “test” split in the repository.** April is a **forecast horizon**: the scripts do not read April actuals for training or in-script evaluation. If you obtain April ground truth later, you can score outputs offline.
+**There is no separate labeled “test” split in the repository.** April is a **forecast horizon** (future period): the scripts do not read April actuals for training or in-script evaluation. If you obtain April ground truth later, you can score outputs offline.
 
-Validation metrics are computed on **open warehouse days** only: rows where `is_warehouse_closed != 1` (see Chinese New Year handling below).
+Validation metrics are computed on **open warehouse days** only: rows where `is_warehouse_closed != 1` (see Chinese New Year handling below). Closed days are excluded so metrics reflect normal operating demand, not holiday shutdown.
 
 ### Tuple universe (which series are modeled)
 
-From the mart through `HISTORY_END`, each model builds a **dense daily panel**: every calendar day × every kept tuple, with missing days filled as `qty_ea = 0`.
+From the mart through `HISTORY_END`, each model builds a **dense daily panel**: for every kept product series, create a row for **every calendar day**, filling days without shipments as `qty_ea = 0`. That way “quantity yesterday” is always defined.
 
-A tuple is **kept** only if it has at least **`MIN_NONZERO_DAYS_TRAIN = 3`** days with `qty_ea > 0` during **training only** (`date <= TRAIN_END`, i.e. January + February). This filters out tuples that never showed intermittent demand in the train window.
+A tuple is **kept** only if it has at least **`MIN_NONZERO_DAYS_TRAIN = 3`** days with `qty_ea > 0` during **training only** (`date <= TRAIN_END`, i.e. January + February). This drops series that never ordered enough in the train window to learn from.
 
 | Model | Grain (`ID_COLS`) | Input mart |
 |-------|-------------------|------------|
 | **Baseline** | `(warehouse, customer_id, product_id)` | `processed/marts/mart_warehouse_customer_product_day.csv` |
 | **Hurdle** | `(warehouse, store, product_id)` | `processed/marts/mart_warehouse_store_product_day.csv` |
+| **Store regression** | `(warehouse, store, product_id)` | same store mart as hurdle |
 
-The hurdle model also carries `customer_id` for aggregation and reporting; store is the extra key versus baseline.
+The hurdle and store-regression models also carry `customer_id` for aggregation and reporting; **store** is the extra key versus baseline.
 
 ---
 
 ### Shared Chinese New Year handling (`src/_cny.py`)
 
-Both models call the same CNY utilities so closure days do not distort lags or training.
+All three models call the same CNY utilities so holiday shutdowns do not look like normal low demand.
+
+**Plain language:** around Chinese New Year some warehouses stop shipping. We mark those **closure days**, do not use their zeros when building “last week’s average” features, and give them **zero weight** during training so the model is not taught to predict shutdown as real demand.
 
 **`detect_warehouse_closure`** — For each `(warehouse, date)`:
 
@@ -160,7 +188,9 @@ Both models call the same CNY utilities so closure days do not distort lags or t
 
 ### Baseline model (`src/04_baseline_model.py`)
 
-Single **HistGradientBoostingRegressor** with **`loss="poisson"`** predicting daily `qty_ea` directly (including zeros on the dense panel).
+**In plain terms:** one machine-learning model guesses **how many units** will move each day for each warehouse×customer×product series, using past quantities and calendar features.
+
+Technically: a single **HistGradientBoostingRegressor** (a **GBDT**—ensemble of decision trees) with **`loss="poisson"`** (suited to non-negative counts) predicting daily `qty_ea` directly, including zeros on the dense panel.
 
 #### Algorithm hyperparameters (`fit_model`)
 
@@ -194,9 +224,11 @@ Encoders are fit on the full history panel; categories unseen at scoring map to 
 
 #### March validation metrics
 
-Row-level MAE, RMSE, SMAPE, bias on open March days, plus monthly rollups summing actual vs predicted `qty_ea` per `(warehouse, customer_id, product_id)`.
+Row-level **MAE**, **RMSE**, **SMAPE**, and **bias** on open March days (see [glossary](docs/modeling_glossary.md)), plus **monthly** rollups that sum actual vs predicted `qty_ea` per `(warehouse, customer_id, product_id)`.
 
 #### April prediction — recursive multi-step
+
+**Recursive** means each forecast day uses **previous predictions** as inputs for lags, not only historical actuals. That can spread small errors across April.
 
 `recursive_forecast` walks **each day** from `FORECAST_START` to `FORECAST_END`:
 
@@ -214,7 +246,9 @@ Outputs include `reports/april_forecast_daily.csv` and monthly aggregates by war
 
 ### Hurdle model (`src/04b_hurdle_model.py`)
 
-A **two-part** model for **intermittent** store-level demand: probability of a positive day × positive quantity size, then optional calibration for April planning totals.
+**In plain terms:** many store×product series order **rarely** (lots of zero days). The hurdle separates **“will there be an order?”** from **“how big will it be?”**, then multiplies those for an expected daily quantity. For April it mainly uses **pattern scheduling** (when orders usually happen) rather than day-by-day recursion.
+
+A **two-part** model for **intermittent** store-level demand: probability of a positive day × positive quantity size, then optional **calibration** (one multiplier per store or network to match target monthly/daily level—see glossary).
 
 #### Part 1 — Order probability (classifier)
 
@@ -230,14 +264,16 @@ A **two-part** model for **intermittent** store-level demand: probability of a p
 
 #### Combined point forecast (`predict_hurdle`)
 
-For each row:
+For each row (March GBDT path):
 
-1. `p_raw` = classifier positive-class probability.
-2. `mu` = regressor prediction (clipped ≥ 0).
-3. **Prior blend** (tuned on March):  
+1. `p_raw` = classifier estimate of **P(order day)**.
+2. `mu` = regressor estimate of **typical quantity on an order day** (trained only where actual > 0).
+3. **Prior blend** (tuned on March): mix `p_raw` with a simple historical order-day rate so very sparse series are not extreme.  
    `p = (1 - λ) * p_raw + λ * p_prior`  
-   where `p_prior = clip(pos_rate_train * k, P_ORDER_MIN, pos_rate_train)` and `pos_rate_train` is each tuple’s Jan–Feb fraction of days with `qty_ea > 0` (`tuple_recursive_priors`).
-4. **Expected quantity**: `pred = clip(p * mu, 0, ∞)`.
+   where `p_prior` comes from each tuple’s Jan–Feb fraction of days with `qty_ea > 0` (`pos_rate_train`).
+4. **Expected daily quantity**: `pred = p × mu` (then clipped so it is not negative).
+
+Intuition: if orders happen 10% of days and typical size is 100 units, expected daily qty ≈ 0.1 × 100 = 10—even though any single day is usually 0 or ~100.
 
 Default constants before tuning: `P_ORDER_BLEND_LAMBDA = 0.10`, `P_ORDER_PRIOR_K = 0.35`, `P_ORDER_MIN = 8e-5`.
 
@@ -298,9 +334,11 @@ For each `(warehouse, store, product_id)`:
 
 **Step B — Pattern forecast (`pattern_forecast_april`)**
 
-- From `last_order_date`, step forward by `mean_gap_days` (clipped 1–28) to propose **order days** in April.
-- Keep a day if its DOW positive rate ≥ `PATTERN_DOW_MIN_FRAC × pos_rate` (default 0.35).
-- On scheduled days: `qty_ea = mean_qty_pos`, `p_order = 1`, `mu_qty = mean_qty_pos`; else zeros.
+*This is the main April behavior shown on store heatmaps (pattern / store-cal files).*
+
+- From `last_order_date`, step forward by `mean_gap_days` (typical days between orders, clipped 1–28) to propose **order days** in April.
+- Keep a day if that weekday historically had enough orders (DOW filter).
+- On scheduled days: assign a typical order size `mean_qty_pos`; other days stay **zero**.
 - Force `qty_ea = 0` on warehouse-closed April days.
 
 **Step C — Per-store calibration (`calibrate_april_per_store`)**
@@ -336,10 +374,20 @@ A **third model** for side-by-side comparison with the hurdle. It uses the **sam
 
 | Aspect | Hurdle (`04b`) | Store regression (`04c`) |
 |--------|----------------|---------------------------|
-| Model structure | Classifier for order days + Poisson regressor on positive days only | **Single** Poisson regressor on all rows (XGBoost GPU when available, else sklearn CPU) |
+| Model structure | Classifier for order days + Poisson regressor on positive days only | **March:** single Poisson regressor (XGBoost GPU when available). **April (default):** gap + DOW pattern from `src/_pattern_forecast.py` |
 | March tuning | Prior blend on `P(order)`; intermittent composite metrics | None |
-| April forecast | Pattern cadence + per-store + network calibration | **Recursive** GBDT day-by-day (like baseline), **no** pattern or calibration layers |
-| Extra features | Cadence gaps, Fourier DOW/DOM | Baseline-style lags/rolls only |
+| April forecast | Pattern cadence + per-store + network calibration | **Pattern cadence** (shared logic with hurdle); optional `STORE_REG_APRIL_MODE=recursive` for legacy Poisson recursion |
+| Extra features | Cadence gaps, Fourier DOW/DOM | Baseline-style lags/rolls for March validation only |
+
+#### Intermittent stores and heatmaps
+
+**Heatmap:** each row is a store, each column is a day; color = total predicted `qty_ea` (sum over products).
+
+Many stores order on a **sparse cadence** (e.g. weekly ~500–600 `qty_ea` on one day, zeros otherwise). A **Poisson regressor** on a dense daily panel learns the **average** units per day, which often appears as **small positives on many days** instead of **zeros + one spike**—so the heatmap shows “orders every day” at low levels.
+
+**Recursive April** worsens that: tiny predictions become “yesterday’s quantity” for the next day. See `scripts/diagnose_store_intermittency.py` (example: 深圳南太云创谷店).
+
+**Default April** uses **pattern continuation** (same idea as hurdle Step B): learn typical gap between orders, last order date, and typical order size; place quantity only on scheduled days. That fixes **timing and sparsity**, not merely multiplying all days by a constant to match the historical mean.
 
 **Design note:** One pooled GBDT with entity encodings covers every store–product tuple the mart contains (rather than fitting a separate linear model per tuple). That matches the scale of the data (~tens of thousands of tuples) and is the same pooling idea as the other GBDT models.
 
@@ -359,19 +407,21 @@ The slow path was **recursive April** (recomputing pandas groupby lags for every
 #### Train / validate / forecast
 
 1. **March validation:** train on `date <= TRAIN_END`; score open March days; write `store_regression_validation_*.csv`.
-2. **April:** retrain on Jan–Mar; **recursive** forecast Apr 1–30 (April predictions feed back into lags for later April days), vectorized per warehouse.
+2. **April (default):** `compute_tuple_order_patterns` + `pattern_forecast_april` on the Jan–Mar dense panel. Set `STORE_REG_APRIL_MODE=recursive` to use the old recursive Poisson path (not recommended for intermittent stores).
 
 #### Outputs
 
 | File | Purpose |
 |------|---------|
-| `reports/store_regression_validation_overall.csv` | March daily + monthly metrics |
-| `reports/store_regression_validation_monthly_actual_vs_pred.csv` | Tuple monthly actual vs pred |
-| `reports/april_forecast_store_regression_daily.csv` | Daily store×product April forecast |
-| `reports/april_forecast_store_regression_monthly_by_store_product.csv` | Native grain monthly rollup |
-| `reports/april_forecast_store_regression_monthly_by_warehouse_customer_product.csv` | Rollup for three-way compare |
+| `reports/store_regression/store_regression_validation_overall.csv` | March daily + monthly metrics |
+| `reports/store_regression/store_regression_validation_monthly_actual_vs_pred.csv` | Tuple monthly actual vs pred |
+| `reports/store_regression/april_forecast_store_regression_daily.csv` | Daily store×product April forecast |
+| `reports/store_regression/april_forecast_store_regression_monthly_by_store_product.csv` | Native grain monthly rollup |
+| `reports/store_regression/april_forecast_store_regression_monthly_by_warehouse_customer_product.csv` | Rollup for three-way compare |
 
 `src/06_compare_models.py` joins baseline, hurdle, and store regression on March validation and April WCP rollups.
+
+Forecast charts: `src/05_visualize_forecast.py` (baseline 11–15, store regression 27–31, all-model comparison 16–19). Store heatmaps: `src/05b_store_april_heatmaps.py` (figures 20–26, 32–34).
 
 ---
 

@@ -1,11 +1,17 @@
-"""Step 4c: Store-level direct regression for April demand (third model).
+"""Step 4c: Store-level demand model (third model).
 
 Modeling grain: (warehouse, store, product_id) x day.
 Target: daily ``qty_ea`` (same as hurdle).
 
+March validation: Poisson GBDT on the dense panel (lags + calendar + CNY).
+April forecast (default): **gap + DOW pattern continuation** (``_pattern_forecast``),
+which schedules sparse order days and puts robust order size on those days only.
+This avoids Poisson "smearing" (tiny positive qty on every day) for intermittent stores.
+
+Set ``STORE_REG_APRIL_MODE=recursive`` to use the legacy recursive Poisson April path.
+
 Optimizations:
     - Vectorized lag/rolling on the dense panel (2D reshape).
-    - Fast recursive April forecast via per-warehouse numpy buffers (no per-day groupby).
     - Optional XGBoost GPU training when CUDA is available (falls back to sklearn CPU).
 """
 
@@ -32,13 +38,23 @@ from _cny import (
     mask_qty_for_features,
 )
 from _metrics import bias_ratio, evaluate_arrays, wmape
+from _pattern_forecast import compute_tuple_order_patterns, pattern_forecast_april
+from _report_paths import (
+    STORE_REG_APRIL_DAILY,
+    STORE_REG_APRIL_MONTHLY_STORE,
+    STORE_REG_APRIL_MONTHLY_WCP,
+    STORE_REG_VALIDATION_MONTHLY,
+    STORE_REG_VALIDATION_OVERALL,
+    STORE_REG_VALIDATION_PER_CUSTOMER,
+    STORE_REG_VALIDATION_PER_WAREHOUSE,
+    ensure_report_dirs,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = PROJECT_ROOT / "processed"
 MARTS = PROCESSED / "marts"
-REPORTS = PROJECT_ROOT / "reports"
-REPORTS.mkdir(parents=True, exist_ok=True)
 
+JAN_START = pd.Timestamp("2026-01-01")
 TRAIN_END = pd.Timestamp("2026-02-28")
 VALID_START = pd.Timestamp("2026-03-01")
 VALID_END = pd.Timestamp("2026-03-28")
@@ -65,6 +81,14 @@ class RegressorModel(Protocol):
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _april_mode() -> str:
+    mode = os.environ.get("STORE_REG_APRIL_MODE", "pattern").strip().lower()
+    if mode not in ("pattern", "recursive"):
+        log(f"Unknown STORE_REG_APRIL_MODE={mode!r}; using pattern")
+        return "pattern"
+    return mode
 
 
 def _want_gpu() -> bool:
@@ -525,6 +549,7 @@ def recursive_forecast(
 
 
 def main() -> int:
+    ensure_report_dirs()
     t_start = time.perf_counter()
     use_gpu = _want_gpu() and _cuda_xgboost_available()
     if use_gpu:
@@ -609,50 +634,56 @@ def main() -> int:
     bias_m = bias_ratio(monthly["actual"].values, monthly["pred"].values)
     log(f"  monthly WMAPE={wmape_m:.4f}  bias_ratio={bias_m:+.4f}")
 
-    per_wh.to_csv(
-        REPORTS / "store_regression_validation_per_warehouse.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    per_cust.to_csv(
-        REPORTS / "store_regression_validation_per_customer.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    monthly.to_csv(
-        REPORTS / "store_regression_validation_monthly_actual_vs_pred.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    per_wh.to_csv(STORE_REG_VALIDATION_PER_WAREHOUSE, index=False, encoding="utf-8-sig")
+    per_cust.to_csv(STORE_REG_VALIDATION_PER_CUSTOMER, index=False, encoding="utf-8-sig")
+    monthly.to_csv(STORE_REG_VALIDATION_MONTHLY, index=False, encoding="utf-8-sig")
     pd.DataFrame(
         [{"metric": f"daily_{k}", "value": v} for k, v in overall.items()]
         + [{"metric": f"monthly_{k}", "value": v} for k, v in monthly_overall.items()]
         + [{"metric": "monthly_wmape", "value": wmape_m}, {"metric": "monthly_bias_ratio", "value": bias_m}]
         + [{"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)}]
-    ).to_csv(REPORTS / "store_regression_validation_overall.csv", index=False, encoding="utf-8-sig")
+    ).to_csv(STORE_REG_VALIDATION_OVERALL, index=False, encoding="utf-8-sig")
 
-    log("Retraining on full history (Jan+Feb+Mar) for April forecast...")
-    full_df = panel_feat
-    w_full = make_sample_weights(full_df)
-    X_full = np.nan_to_num(full_df[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
-    y_full = full_df["qty_ea"].to_numpy(dtype=np.float64)
-    t_train = time.perf_counter()
-    model_full, backend = fit_model(X_full, y_full, w_full, use_gpu=use_gpu)
-    log(f"  train time: {time.perf_counter() - t_train:.1f}s")
-
-    log("Recursive forecast for April (vectorized)...")
-    t_rec = time.perf_counter()
     forecast_dates = pd.date_range(FORECAST_START, FORECAST_END, freq="D")
-    daily_fc = recursive_forecast(model_full, backend, panel, forecast_dates, encoders, closure)
-    log(f"  recursive total: {time.perf_counter() - t_rec:.1f}s")
+    april_mode = _april_mode()
+    t_rec = time.perf_counter()
+    if april_mode == "recursive":
+        log("Retraining on full history (Jan+Feb+Mar) for recursive April...")
+        full_df = panel_feat
+        w_full = make_sample_weights(full_df)
+        X_full = np.nan_to_num(full_df[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
+        y_full = full_df["qty_ea"].to_numpy(dtype=np.float64)
+        t_train = time.perf_counter()
+        model_full, backend = fit_model(X_full, y_full, w_full, use_gpu=use_gpu)
+        log(f"  train time: {time.perf_counter() - t_train:.1f}s")
+        log("April forecast: recursive Poisson (STORE_REG_APRIL_MODE=recursive)...")
+        daily_fc = recursive_forecast(
+            model_full, backend, panel, forecast_dates, encoders, closure
+        )
+    else:
+        log("April forecast: gap + DOW pattern (intermittent order days)...")
+        patterns = compute_tuple_order_patterns(
+            panel,
+            history_end=HISTORY_END,
+            jan_start=JAN_START,
+        )
+        daily_fc = pattern_forecast_april(
+            patterns,
+            forecast_dates,
+            closure,
+            forecast_start=FORECAST_START,
+            forecast_end=FORECAST_END,
+        )
+        log(
+            f"  pattern tuples={len(patterns):,}  "
+            f"mean gap={patterns['mean_gap_days'].mean():.2f}d  "
+            f"mean pos_rate={patterns['pos_rate'].mean():.3f}"
+        )
+    log(f"  April forecast total: {time.perf_counter() - t_rec:.1f}s")
 
     name_lookup = panel[ID_COLS + ["product_name", "temperature_zone"]].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
-    daily_fc.to_csv(
-        REPORTS / "april_forecast_store_regression_daily.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    daily_fc.to_csv(STORE_REG_APRIL_DAILY, index=False, encoding="utf-8-sig")
 
     monthly_store = (
         daily_fc.groupby(ID_COLS + ["customer_id", "product_name", "temperature_zone"])["qty_ea"]
@@ -660,11 +691,7 @@ def main() -> int:
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
-    monthly_store.to_csv(
-        REPORTS / "april_forecast_store_regression_monthly_by_store_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    monthly_store.to_csv(STORE_REG_APRIL_MONTHLY_STORE, index=False, encoding="utf-8-sig")
 
     monthly_wcp = (
         daily_fc.groupby(["warehouse", "customer_id", "product_id", "product_name", "temperature_zone"])[
@@ -674,11 +701,7 @@ def main() -> int:
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
-    monthly_wcp.to_csv(
-        REPORTS / "april_forecast_store_regression_monthly_by_warehouse_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    monthly_wcp.to_csv(STORE_REG_APRIL_MONTHLY_WCP, index=False, encoding="utf-8-sig")
 
     log("Done.")
     log(f"April daily forecast rows: {len(daily_fc):,}")

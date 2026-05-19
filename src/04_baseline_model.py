@@ -34,13 +34,22 @@ from _cny import (
     mask_qty_for_features,
 )
 from _metrics import evaluate_arrays
+from _report_paths import (
+    BASELINE_APRIL_DAILY,
+    BASELINE_APRIL_MONTHLY_CP,
+    BASELINE_APRIL_MONTHLY_WCP,
+    BASELINE_APRIL_MONTHLY_WH,
+    BASELINE_VALIDATION_MONTHLY,
+    BASELINE_VALIDATION_OVERALL,
+    BASELINE_VALIDATION_PER_CUSTOMER,
+    BASELINE_VALIDATION_PER_WAREHOUSE,
+    ensure_report_dirs,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = PROJECT_ROOT / "processed"
 MARTS = PROCESSED / "marts"
-REPORTS = PROJECT_ROOT / "reports"
 MODELS = PROJECT_ROOT / "models"
-REPORTS.mkdir(parents=True, exist_ok=True)
 MODELS.mkdir(parents=True, exist_ok=True)
 
 TRAIN_END = pd.Timestamp("2026-02-28")
@@ -266,6 +275,7 @@ def recursive_forecast(
 
 
 def main() -> int:
+    ensure_report_dirs()
     log("Loading base panel...")
     raw = load_panel_base()
 
@@ -331,13 +341,13 @@ def main() -> int:
     )
     monthly_overall = evaluate("monthly (wh,cust,prod)", monthly["actual"].values, monthly["pred"].values)
 
-    per_wh.to_csv(REPORTS / "baseline_validation_per_warehouse.csv", index=False, encoding="utf-8-sig")
-    per_cust.to_csv(REPORTS / "baseline_validation_per_customer.csv", index=False, encoding="utf-8-sig")
-    monthly.to_csv(REPORTS / "baseline_validation_monthly_actual_vs_pred.csv", index=False, encoding="utf-8-sig")
+    per_wh.to_csv(BASELINE_VALIDATION_PER_WAREHOUSE, index=False, encoding="utf-8-sig")
+    per_cust.to_csv(BASELINE_VALIDATION_PER_CUSTOMER, index=False, encoding="utf-8-sig")
+    monthly.to_csv(BASELINE_VALIDATION_MONTHLY, index=False, encoding="utf-8-sig")
     pd.DataFrame(
         [{"metric": f"daily_{k}", "value": v} for k, v in overall.items()]
         + [{"metric": f"monthly_{k}", "value": v} for k, v in monthly_overall.items()]
-    ).to_csv(REPORTS / "baseline_validation_overall.csv", index=False, encoding="utf-8-sig")
+    ).to_csv(BASELINE_VALIDATION_OVERALL, index=False, encoding="utf-8-sig")
 
     log("Retraining on full history (Jan+Feb+Mar) for April forecast...")
     full_df = panel_feat.copy()
@@ -352,27 +362,19 @@ def main() -> int:
 
     name_lookup = panel[ID_COLS + ["product_name", "temperature_zone"]].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
-    daily_fc.to_csv(REPORTS / "april_forecast_daily.csv", index=False, encoding="utf-8-sig")
+    daily_fc.to_csv(BASELINE_APRIL_DAILY, index=False, encoding="utf-8-sig")
 
     monthly_wcp = (
         daily_fc.groupby(ID_COLS + ["product_name", "temperature_zone"])  
         ["qty_ea"].sum().reset_index().rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
-    monthly_wcp.to_csv(
-        REPORTS / "april_forecast_monthly_by_warehouse_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    monthly_wcp.to_csv(BASELINE_APRIL_MONTHLY_WCP, index=False, encoding="utf-8-sig")
 
     monthly_cp = (
         daily_fc.groupby(["customer_id", "product_id", "product_name", "temperature_zone"])
         ["qty_ea"].sum().reset_index().rename(columns={"qty_ea": "predicted_qty_ea_april"})
     )
-    monthly_cp.to_csv(
-        REPORTS / "april_forecast_monthly_by_customer_product.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
+    monthly_cp.to_csv(BASELINE_APRIL_MONTHLY_CP, index=False, encoding="utf-8-sig")
 
     monthly_wh = (
         daily_fc.groupby("warehouse")["qty_ea"]
@@ -381,7 +383,7 @@ def main() -> int:
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
         .sort_values("predicted_qty_ea_april", ascending=False)
     )
-    monthly_wh.to_csv(REPORTS / "april_forecast_monthly_by_warehouse.csv", index=False, encoding="utf-8-sig")
+    monthly_wh.to_csv(BASELINE_APRIL_MONTHLY_WH, index=False, encoding="utf-8-sig")
 
     log("Done.")
     log(f"April daily forecast rows: {len(daily_fc):,}")
