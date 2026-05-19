@@ -209,8 +209,8 @@ def fig_store_order_boxes_heatmap(orders: pd.DataFrame) -> None:
     ax.set_xticklabels(
         [pd.Timestamp(d).strftime("%m-%d") for d in pivot.columns[::tick_step]], rotation=45
     )
-    ax.set_title("Daily 预计总箱数 heatmap (top 20 收货门店, sum per day)")
-    fig.colorbar(im, ax=ax, label="预计总箱数 (sum)")
+    ax.set_title("Daily estimated total order quantity (in boxes) heatmap (top 20 receiving stores, sum per day)")
+    fig.colorbar(im, ax=ax, label="estimated total order quantity (boxes)")
     save(fig, "10_store_order_boxes_heatmap.png")
 
 

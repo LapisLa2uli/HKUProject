@@ -1,4 +1,4 @@
-"""Compare baseline vs hurdle forecasts and March validation."""
+"""Compare baseline vs hurdle vs store regression forecasts and March validation."""
 
 from __future__ import annotations
 
@@ -35,12 +35,32 @@ def load_hurdle_march() -> tuple[pd.DataFrame, dict[str, float]]:
     return monthly, keys
 
 
+def load_store_regression_march() -> tuple[pd.DataFrame, dict[str, float]]:
+    monthly = pd.read_csv(
+        REPORTS / "store_regression_validation_monthly_actual_vs_pred.csv"
+    )
+    overall_df = pd.read_csv(REPORTS / "store_regression_validation_overall.csv")
+    keys = overall_df.set_index("metric")["value"].to_dict()
+    return monthly, keys
+
+
 def rollup_hurdle_april() -> pd.DataFrame:
     daily = pd.read_csv(REPORTS / "april_forecast_hurdle_daily.csv", parse_dates=["date"])
     return (
         daily.groupby(["warehouse", "customer_id", "product_id"], as_index=False)["qty_ea"]
         .sum()
         .rename(columns={"qty_ea": "hurdle_predicted_qty_ea_april"})
+    )
+
+
+def rollup_store_regression_april() -> pd.DataFrame:
+    daily = pd.read_csv(
+        REPORTS / "april_forecast_store_regression_daily.csv", parse_dates=["date"]
+    )
+    return (
+        daily.groupby(["warehouse", "customer_id", "product_id"], as_index=False)["qty_ea"]
+        .sum()
+        .rename(columns={"qty_ea": "store_regression_predicted_qty_ea_april"})
     )
 
 
@@ -56,9 +76,13 @@ def main() -> int:
 
     base_m, base_keys = load_baseline_march()
     hur_m, hur_keys = load_hurdle_march()
+    store_m, store_keys = load_store_regression_march()
 
     base_m = base_m.rename(columns={"actual": "march_actual", "pred": "march_pred_baseline"})
     hur_m = hur_m.rename(columns={"actual": "march_actual_h", "pred": "march_pred_hurdle"})
+    store_m = store_m.rename(
+        columns={"actual": "march_actual_s", "pred": "march_pred_store_regression"}
+    )
 
     post_bias = bias_ratio(
         base_m["march_actual"].values,
@@ -67,51 +91,65 @@ def main() -> int:
 
     base_daily_mae = base_keys.get("daily_mae", np.nan)
     hur_daily_mae = hur_keys.get("daily_mae", np.nan)
+    store_daily_mae = store_keys.get("daily_mae", np.nan)
 
     h_act = hur_m["march_actual_h"].values
     h_pred = hur_m["march_pred_hurdle"].values
+    s_act = store_m["march_actual_s"].values
+    s_pred = store_m["march_pred_store_regression"].values
 
     base_apr = load_baseline_april_wcp()
     hur_apr = rollup_hurdle_april()
+    store_apr = rollup_store_regression_april()
+
     cmp_apr = base_apr.merge(
         hur_apr,
         on=["warehouse", "customer_id", "product_id"],
         how="outer",
+    ).merge(
+        store_apr,
+        on=["warehouse", "customer_id", "product_id"],
+        how="outer",
     ).fillna(0.0)
-    cmp_apr["diff"] = (
+
+    cmp_apr["diff_hurdle_vs_baseline"] = (
         cmp_apr["hurdle_predicted_qty_ea_april"] - cmp_apr["baseline_predicted_qty_ea_april"]
     )
+    cmp_apr["diff_store_vs_hurdle"] = (
+        cmp_apr["store_regression_predicted_qty_ea_april"]
+        - cmp_apr["hurdle_predicted_qty_ea_april"]
+    )
+    cmp_apr["diff_store_vs_baseline"] = (
+        cmp_apr["store_regression_predicted_qty_ea_april"]
+        - cmp_apr["baseline_predicted_qty_ea_april"]
+    )
     denom = cmp_apr["baseline_predicted_qty_ea_april"].replace(0, np.nan)
-    cmp_apr["pct_diff_vs_baseline"] = 100.0 * cmp_apr["diff"] / denom
-
-    wh_apr = (
-        cmp_apr.groupby("warehouse", as_index=False)[
-            ["baseline_predicted_qty_ea_april", "hurdle_predicted_qty_ea_april"]
-        ]
-        .sum()
-    )
-    wh_apr["diff"] = (
-        wh_apr["hurdle_predicted_qty_ea_april"] - wh_apr["baseline_predicted_qty_ea_april"]
+    cmp_apr["pct_diff_hurdle_vs_baseline"] = (
+        100.0 * cmp_apr["diff_hurdle_vs_baseline"] / denom
     )
 
-    cust_apr = (
-        cmp_apr.groupby("customer_id", as_index=False)[
-            ["baseline_predicted_qty_ea_april", "hurdle_predicted_qty_ea_april"]
-        ]
-        .sum()
-    )
-    cust_apr["diff"] = (
-        cust_apr["hurdle_predicted_qty_ea_april"] - cust_apr["baseline_predicted_qty_ea_april"]
+    model_cols = [
+        "baseline_predicted_qty_ea_april",
+        "hurdle_predicted_qty_ea_april",
+        "store_regression_predicted_qty_ea_april",
+    ]
+
+    wh_apr = cmp_apr.groupby("warehouse", as_index=False)[model_cols].sum()
+    wh_apr["diff_store_vs_hurdle"] = (
+        wh_apr["store_regression_predicted_qty_ea_april"]
+        - wh_apr["hurdle_predicted_qty_ea_april"]
     )
 
-    cp_apr = (
-        cmp_apr.groupby(["customer_id", "product_id"], as_index=False)[
-            ["baseline_predicted_qty_ea_april", "hurdle_predicted_qty_ea_april"]
-        ]
-        .sum()
+    cust_apr = cmp_apr.groupby("customer_id", as_index=False)[model_cols].sum()
+    cust_apr["diff_store_vs_hurdle"] = (
+        cust_apr["store_regression_predicted_qty_ea_april"]
+        - cust_apr["hurdle_predicted_qty_ea_april"]
     )
-    cp_apr["diff"] = (
-        cp_apr["hurdle_predicted_qty_ea_april"] - cp_apr["baseline_predicted_qty_ea_april"]
+
+    cp_apr = cmp_apr.groupby(["customer_id", "product_id"], as_index=False)[model_cols].sum()
+    cp_apr["diff_store_vs_hurdle"] = (
+        cp_apr["store_regression_predicted_qty_ea_april"]
+        - cp_apr["hurdle_predicted_qty_ea_april"]
     )
 
     summary_rows = [
@@ -125,6 +163,7 @@ def main() -> int:
         },
         {"metric": "baseline_daily_mae", "value": base_daily_mae},
         {"metric": "hurdle_daily_mae", "value": hur_daily_mae},
+        {"metric": "store_regression_daily_mae", "value": store_daily_mae},
         {
             "metric": "baseline_march_monthly_wmape",
             "value": wmape(base_m["march_actual"].values, base_m["march_pred_baseline"].values),
@@ -134,12 +173,20 @@ def main() -> int:
             "value": wmape(h_act, h_pred),
         },
         {
+            "metric": "store_regression_march_monthly_wmape",
+            "value": wmape(s_act, s_pred),
+        },
+        {
             "metric": "april_total_baseline",
             "value": float(cmp_apr["baseline_predicted_qty_ea_april"].sum()),
         },
         {
             "metric": "april_total_hurdle",
             "value": float(cmp_apr["hurdle_predicted_qty_ea_april"].sum()),
+        },
+        {
+            "metric": "april_total_store_regression",
+            "value": float(cmp_apr["store_regression_predicted_qty_ea_april"].sum()),
         },
     ]
     pd.DataFrame(summary_rows).to_csv(
@@ -162,9 +209,9 @@ def main() -> int:
         encoding="utf-8-sig",
     )
 
-    md = f"""# Model comparison (baseline vs store hurdle)
+    md = f"""# Model comparison (baseline vs hurdle vs store regression)
 
-## March validation — baseline bias (CNY handling)
+## March validation
 
 | Metric | Value |
 |--------|------:|
@@ -172,13 +219,18 @@ def main() -> int:
 | Baseline bias ratio **after** CNY handling (current run) | {100*post_bias:.2f}% |
 | Baseline daily MAE | {base_daily_mae:.4f} |
 | Hurdle daily MAE | {hur_daily_mae:.4f} |
+| Store regression daily MAE | {store_daily_mae:.4f} |
+| Baseline March monthly WMAPE | {wmape(base_m['march_actual'].values, base_m['march_pred_baseline'].values):.4f} |
+| Hurdle March monthly WMAPE | {wmape(h_act, h_pred):.4f} |
+| Store regression March monthly WMAPE | {wmape(s_act, s_pred):.4f} |
 
-## April totals (hurdle rolled up to warehouse–customer–product)
+## April totals (store regression and hurdle rolled up to warehouse–customer–product)
 
 | Model | Total predicted qty_ea |
 |-------|------------------------:|
 | Baseline | {cmp_apr['baseline_predicted_qty_ea_april'].sum():,.0f} |
 | Hurdle (rolled up) | {cmp_apr['hurdle_predicted_qty_ea_april'].sum():,.0f} |
+| Store regression (rolled up) | {cmp_apr['store_regression_predicted_qty_ea_april'].sum():,.0f} |
 
 See `model_comparison.csv` and `model_comparison_april_*.csv`.
 """

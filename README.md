@@ -1,6 +1,6 @@
 # HKU warehouse demand forecasting
 
-Pipeline that cleans monthly Excel extracts, builds warehouse-centric data marts, fits baseline and hurdle (two-part) GBDT models, and writes forecasts and charts under `reports/`.
+Pipeline that cleans monthly Excel extracts, builds warehouse-centric data marts, fits baseline, hurdle (two-part), and store-level regression models, and writes forecasts and charts under `reports/`.
 
 Raw spreadsheets and regenerated CSV outputs are **not** tracked in Git (see `.gitignore`). Clone the repo, add your own files under `Data/`, then run the steps below.
 
@@ -46,7 +46,7 @@ Required sheets and column naming match the HKU coursework extracts processed by
 
 If your filenames or calendar periods differ, edit `SOURCE_FILES` near the top of `src/01_clean_data.py` (paths and month labels).
 
-Model scripts assume **2026** calendar splits (train through February, validate March, forecast April). To use another year or cutoff dates, adjust the date constants at the top of `src/04_baseline_model.py` and `src/04b_hurdle_model.py` consistently.
+Model scripts assume **2026** calendar splits (train through February, validate March, forecast April). To use another year or cutoff dates, adjust the date constants at the top of `src/04_baseline_model.py`, `src/04b_hurdle_model.py`, and `src/04c_store_regression_model.py` consistently.
 
 ## 3. Run the pipeline (from scratch)
 
@@ -58,6 +58,7 @@ python src/02_build_marts.py
 python src/03_visualize.py
 python src/04_baseline_model.py
 python src/04b_hurdle_model.py
+python src/04c_store_regression_model.py
 python src/05_visualize_forecast.py
 python src/05b_store_april_heatmaps.py
 python src/06_compare_models.py
@@ -74,7 +75,7 @@ Optional debugging utilities live under `scripts/`.
 
 ## Model methodology
 
-This section documents how data are split, how features are built, and how the baseline and hurdle models train, validate, and forecast. Implementation lives in `src/04_baseline_model.py`, `src/04b_hurdle_model.py`, and shared helpers in `src/_cny.py` and `src/_metrics.py`.
+This section documents how data are split, how features are built, and how the baseline, hurdle, and store regression models train, validate, and forecast. Implementation lives in `src/04_baseline_model.py`, `src/04b_hurdle_model.py`, `src/04c_store_regression_model.py`, and shared helpers in `src/_cny.py` and `src/_metrics.py`.
 
 ### Pipeline overview
 
@@ -87,11 +88,18 @@ flowchart LR
   mart_store[mart_warehouse_store_product_day]
   baseline[src/04_baseline_model.py]
   hurdle[src/04b_hurdle_model.py]
+  storeReg[src/04c_store_regression_model.py]
+  compare[src/06_compare_models.py]
   reports[reports/ CSV and figures]
 
   raw --> clean --> marts
   marts --> mart_cp --> baseline --> reports
   marts --> mart_store --> hurdle --> reports
+  marts --> mart_store --> storeReg --> reports
+  baseline --> compare
+  hurdle --> compare
+  storeReg --> compare
+  compare --> reports
 ```
 
 ### Calendar splits and what counts as “test”
@@ -316,7 +324,54 @@ For each `(warehouse, customer_id, store)`:
 
 Monthly rollups and calibration diagnostics: `reports/april_forecast_hurdle_monthly_*.csv`, `reports/hurdle_april_store_calibration.csv`, `reports/hurdle_april_calibration.csv`.
 
-Visualizations in `src/05_visualize_forecast.py` and `src/05b_store_april_heatmaps.py` typically use the **pattern** and **store-calibrated** daily files; compare to baseline via `src/06_compare_models.py`.
+Visualizations in `src/05_visualize_forecast.py` and `src/05b_store_april_heatmaps.py` typically use the **pattern** and **store-calibrated** daily files; compare all three models via `src/06_compare_models.py`.
+
+---
+
+### Store regression model (`src/04c_store_regression_model.py`)
+
+A **third model** for side-by-side comparison with the hurdle. It uses the **same problem setup** as the hurdle in several ways: daily **`qty_ea`** at **`(warehouse, store, product_id)`**, the same mart (`mart_warehouse_store_product_day.csv`), the same calendar splits (Jan–Feb train, March validate, April forecast), the same tuple filter (`MIN_NONZERO_DAYS_TRAIN = 3` non-zero days in training), and the same Chinese New Year masking and sample weights from `src/_cny.py`.
+
+**How it differs from the hurdle**
+
+| Aspect | Hurdle (`04b`) | Store regression (`04c`) |
+|--------|----------------|---------------------------|
+| Model structure | Classifier for order days + Poisson regressor on positive days only | **Single** Poisson regressor on all rows (XGBoost GPU when available, else sklearn CPU) |
+| March tuning | Prior blend on `P(order)`; intermittent composite metrics | None |
+| April forecast | Pattern cadence + per-store + network calibration | **Recursive** GBDT day-by-day (like baseline), **no** pattern or calibration layers |
+| Extra features | Cadence gaps, Fourier DOW/DOM | Baseline-style lags/rolls only |
+
+**Design note:** One pooled GBDT with entity encodings covers every store–product tuple the mart contains (rather than fitting a separate linear model per tuple). That matches the scale of the data (~tens of thousands of tuples) and is the same pooling idea as the other GBDT models.
+
+#### Features
+
+- Categorical encodings: `warehouse`, `store`, `product_id`, `customer_id`, `temperature_zone`
+- Lags on `qty_ea_masked`: 1, 2, 3, 7, 14, 21, 28 days
+- Rolling stats (shift 1) for windows 7, 14, 28: mean, std, max, nonzero_ratio
+- Calendar + CNY fields
+
+Hyperparameters align with baseline: Poisson loss, `learning_rate=0.06`, 600 boosting rounds, ~63 leaves (`max_leaf_nodes` / `max_leaves`).
+
+#### Performance (typical laptop with NVIDIA GPU)
+
+The slow path was **recursive April** (recomputing pandas groupby lags for every warehouse × day). With **vectorized dense-panel lags** and **numpy ring-buffer recursive forecast**, a full run is about **1–2 minutes** end-to-end (well under a 20-minute budget). Training uses **XGBoost on CUDA** when available (`xgboost` in `requirements.txt`); set `STORE_REG_CPU=1` to force sklearn on CPU. Set `STORE_REG_USE_GPU=0` to disable GPU even if CUDA works.
+
+#### Train / validate / forecast
+
+1. **March validation:** train on `date <= TRAIN_END`; score open March days; write `store_regression_validation_*.csv`.
+2. **April:** retrain on Jan–Mar; **recursive** forecast Apr 1–30 (April predictions feed back into lags for later April days), vectorized per warehouse.
+
+#### Outputs
+
+| File | Purpose |
+|------|---------|
+| `reports/store_regression_validation_overall.csv` | March daily + monthly metrics |
+| `reports/store_regression_validation_monthly_actual_vs_pred.csv` | Tuple monthly actual vs pred |
+| `reports/april_forecast_store_regression_daily.csv` | Daily store×product April forecast |
+| `reports/april_forecast_store_regression_monthly_by_store_product.csv` | Native grain monthly rollup |
+| `reports/april_forecast_store_regression_monthly_by_warehouse_customer_product.csv` | Rollup for three-way compare |
+
+`src/06_compare_models.py` joins baseline, hurdle, and store regression on March validation and April WCP rollups.
 
 ---
 
@@ -326,7 +381,7 @@ All calendar boundaries and most hyperparameters are **Python constants** in the
 
 1. Update `SOURCE_FILES` and labels in `src/01_clean_data.py`.
 2. Update `TRAIN_END`, `VALID_*`, `FORECAST_*`, and CNY dates in `src/_cny.py` if needed.
-3. Update the same split constants in **both** `src/04_baseline_model.py` and `src/04b_hurdle_model.py`.
+3. Update the same split constants in `src/04_baseline_model.py`, `src/04b_hurdle_model.py`, and `src/04c_store_regression_model.py`.
 
 Re-run the full pipeline from step 1 so marts and reports stay consistent.
 
