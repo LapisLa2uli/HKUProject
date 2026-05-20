@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
 _SRC = Path(__file__).resolve().parent
@@ -108,6 +109,8 @@ PLANNING_QTY_REL_TOL = 0.15
 P_ORDER_BLEND_LAMBDA = 0.10
 P_ORDER_PRIOR_K = 0.35
 P_ORDER_MIN = 8e-5
+# Up-weight large order days when fitting the size (μ) regressor: weight *= qty^power.
+REG_QTY_WEIGHT_POWER = 0.5
 ROLL_QTY_MIN_FRAC_SEED = 0.35  # rolling buffer qty >= max(pred, frac * seed_qty)
 # When tuning prior blend: tiny weight on decision-rule SMAPE (see tune_prior_hyperparams).
 PRIOR_TUNE_DECISION_SMAPE_WEIGHT = 0.04
@@ -702,6 +705,61 @@ def feature_columns() -> list[str]:
     return cols
 
 
+def _classifier_pos_weight(y_bin: np.ndarray) -> float:
+    y = np.asarray(y_bin, dtype=np.int8)
+    n_pos = float(np.sum(y == 1))
+    n_neg = float(len(y) - n_pos)
+    return n_neg / max(n_pos, 1.0)
+
+
+def _regressor_qty_weights(
+    y_qty: np.ndarray,
+    base_weight: np.ndarray | None,
+    *,
+    power: float = REG_QTY_WEIGHT_POWER,
+) -> np.ndarray:
+    y = np.maximum(np.asarray(y_qty, dtype=np.float64), 1.0)
+    w = np.power(y, power)
+    if base_weight is not None:
+        w = w * np.asarray(base_weight, dtype=np.float64)
+    return w / max(float(np.mean(w)), 1e-9)
+
+
+def fit_probability_calibrator(
+    p_raw: np.ndarray,
+    y_bin: np.ndarray,
+) -> IsotonicRegression | None:
+    """Isotonic map from raw classifier scores to calibrated P(order)."""
+    p = np.clip(np.asarray(p_raw, dtype=np.float64), 0.0, 1.0)
+    y = np.asarray(y_bin, dtype=np.int8)
+    if len(y) < 32 or len(np.unique(y)) < 2:
+        return None
+    cal = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    cal.fit(p, y)
+    return cal
+
+
+def apply_probability_calibrator(
+    calibrator: IsotonicRegression | None,
+    p_raw: np.ndarray,
+) -> np.ndarray:
+    if calibrator is None:
+        return np.clip(np.asarray(p_raw, dtype=np.float64), 0.0, 1.0)
+    return np.clip(calibrator.predict(np.asarray(p_raw, dtype=np.float64)), 0.0, 1.0)
+
+
+def raw_p_order(
+    clf: object,
+    X: pd.DataFrame | np.ndarray,
+    *,
+    clf_backend: str = "sklearn_cpu",
+) -> np.ndarray:
+    X_arr = X.to_numpy(dtype=np.float64) if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=np.float64)
+    if clf_backend == "xgboost_cuda":
+        return predict_proba_positive(clf, clf_backend, X_arr)
+    return clf.predict_proba(X_arr)[:, 1]
+
+
 def fit_hurdle(
     X: pd.DataFrame | np.ndarray,
     y_qty: pd.Series | np.ndarray,
@@ -715,17 +773,29 @@ def fit_hurdle(
         X_arr = np.asarray(X, dtype=np.float64)
     y_arr = y_qty.to_numpy(dtype=np.float64) if isinstance(y_qty, pd.Series) else np.asarray(y_qty, dtype=np.float64)
     y_bin = (y_arr > 0).astype(np.int8)
+    pos_w = _classifier_pos_weight(y_bin)
 
     if use_gpu:
-        clf, clf_b = fit_classifier(X_arr, y_bin, sample_weight, use_gpu=True, num_boost_round=200)
+        clf, clf_b = fit_classifier(
+            X_arr,
+            y_bin,
+            sample_weight,
+            use_gpu=True,
+            num_boost_round=200,
+            params={"scale_pos_weight": pos_w},
+        )
         pos = y_bin == 1
+        reg_w = _regressor_qty_weights(
+            y_arr[pos],
+            sample_weight[pos] if sample_weight is not None else None,
+        )
         reg, reg_b = fit_regressor(
             X_arr[pos],
             y_arr[pos],
-            sample_weight[pos] if sample_weight is not None else None,
+            reg_w,
             use_gpu=True,
-            num_boost_round=350,
-            params={"learning_rate": 0.08},
+            num_boost_round=450,
+            params={"learning_rate": 0.08, "max_depth": 10},
         )
         return clf, reg, clf_b, reg_b
 
@@ -740,17 +810,21 @@ def fit_hurdle(
     )
     clf.fit(X_arr, y_bin, sample_weight=sample_weight)
     pos = y_bin == 1
+    reg_w = _regressor_qty_weights(
+        y_arr[pos],
+        sample_weight[pos] if sample_weight is not None else None,
+    )
     reg = HistGradientBoostingRegressor(
         loss="poisson",
         learning_rate=0.08,
-        max_iter=350,
-        max_leaf_nodes=48,
-        min_samples_leaf=200,
+        max_iter=450,
+        max_leaf_nodes=63,
+        min_samples_leaf=80,
         l2_regularization=0.0,
         early_stopping=False,
         random_state=42,
     )
-    reg.fit(X_arr[pos], y_arr[pos], sample_weight=sample_weight[pos])
+    reg.fit(X_arr[pos], y_arr[pos], sample_weight=reg_w)
     return clf, reg, "sklearn_cpu", "sklearn_cpu"
 
 
@@ -764,12 +838,13 @@ def predict_hurdle(
     reg_backend: str = "sklearn_cpu",
     blend_lambda: float | None = None,
     prior_k: float | None = None,
+    prob_calibrator: IsotonicRegression | None = None,
+    order_threshold: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     X_arr = X.to_numpy(dtype=np.float64) if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=np.float64)
-    if clf_backend == "xgboost_cuda":
-        p_raw = predict_proba_positive(clf, clf_backend, X_arr)
-    else:
-        p_raw = clf.predict_proba(X_arr)[:, 1]
+    p_raw = apply_probability_calibrator(
+        prob_calibrator, raw_p_order(clf, X_arr, clf_backend=clf_backend)
+    )
     mu = np.clip(gbdt_predict(reg, reg_backend, X_arr), 0, None)
     lam = P_ORDER_BLEND_LAMBDA if blend_lambda is None else float(blend_lambda)
     k = P_ORDER_PRIOR_K if prior_k is None else float(prior_k)
@@ -780,7 +855,8 @@ def predict_hurdle(
         p_prior = np.clip(pr * k, P_ORDER_MIN, pr)
         p = (1.0 - lam) * p_raw + lam * p_prior
         p = np.clip(p, 0.0, 1.0)
-    order = (p >= ORDER_PROB_THRESHOLD).astype(np.float64)
+    tau = ORDER_PROB_THRESHOLD if order_threshold is None else float(order_threshold)
+    order = (p >= tau).astype(np.float64)
     pred = np.clip(order * mu, 0, None)
     return pred, p, mu
 
@@ -793,6 +869,7 @@ def tune_prior_hyperparams(
     *,
     clf_backend: str = "sklearn_cpu",
     reg_backend: str = "sklearn_cpu",
+    prob_calibrator: IsotonicRegression | None = None,
 ) -> tuple[float, float]:
     """Pick (blend_lambda, prior_k) from March validation.
 
@@ -810,9 +887,9 @@ def tune_prior_hyperparams(
         .rename(columns={"qty_ea": "actual"})
     )
 
-    lambdas = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25]
-    ks = [0.20, 0.30, 0.35, 0.45, 0.55]
-    best_lam, best_k = 0.0, P_ORDER_PRIOR_K
+    lambdas = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
+    ks = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 1.0]
+    best_lam, best_k = 0.25, P_ORDER_PRIOR_K
     best_score = float("inf")
     best_br_err = float("inf")
 
@@ -821,6 +898,7 @@ def tune_prior_hyperparams(
             pred, p_ord, _ = predict_hurdle(
                 clf, reg, X, pr, blend_lambda=lam, prior_k=k,
                 clf_backend=clf_backend, reg_backend=reg_backend,
+                prob_calibrator=prob_calibrator,
             )
             pred_df = valid_open[keys].copy()
             pred_df["pred"] = pred
@@ -845,6 +923,68 @@ def tune_prior_hyperparams(
         f"→ {best_score:.4f}; monthly |bias_ratio-1| alone → {best_br_err:.4f})"
     )
     return best_lam, best_k
+
+
+def tune_order_prob_threshold(
+    clf: object,
+    reg: object,
+    valid_open: pd.DataFrame,
+    feat_cols: list[str],
+    *,
+    blend_lambda: float,
+    prior_k: float,
+    clf_backend: str = "sklearn_cpu",
+    reg_backend: str = "sklearn_cpu",
+    prob_calibrator: IsotonicRegression | None = None,
+) -> float:
+    """Pick P(order) cutoff for hard hurdle to minimize |monthly bias_ratio - 1|."""
+    X = valid_open[feat_cols].fillna(0.0)
+    pr = valid_open["pos_rate_train"].values
+    keys = ID_COLS + ["customer_id"]
+    actual_m = (
+        valid_open.groupby(keys, as_index=False)["qty_ea"]
+        .sum()
+        .rename(columns={"qty_ea": "actual"})
+    )
+    taus = [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50]
+    best_tau = ORDER_PROB_THRESHOLD
+    best_br_err = float("inf")
+    best_fire = 0.0
+
+    for tau in taus:
+        pred, p_ord, _ = predict_hurdle(
+            clf,
+            reg,
+            X,
+            pr,
+            blend_lambda=blend_lambda,
+            prior_k=prior_k,
+            clf_backend=clf_backend,
+            reg_backend=reg_backend,
+            prob_calibrator=prob_calibrator,
+            order_threshold=tau,
+        )
+        pred_df = valid_open[keys].copy()
+        pred_df["pred"] = pred
+        pred_m = pred_df.groupby(keys, as_index=False)["pred"].sum()
+        merged = actual_m.merge(pred_m, on=keys, how="inner")
+        if merged["actual"].sum() <= 0:
+            continue
+        br = bias_ratio(merged["actual"].values, merged["pred"].values)
+        br_err = abs(br - 1.0)
+        fire = float((p_ord >= tau).mean())
+        if br_err < best_br_err - 1e-9 or (
+            abs(br_err - best_br_err) <= 1e-9 and fire > best_fire
+        ):
+            best_br_err = br_err
+            best_tau = tau
+            best_fire = fire
+
+    log(
+        f"  tuned ORDER_PROB_THRESHOLD={best_tau:.2f}  "
+        f"(monthly |bias_ratio-1|={best_br_err:.4f}  fire_rate={best_fire:.4f})"
+    )
+    return best_tau
 
 
 def soften_april_first_day_spike(daily_fc: pd.DataFrame) -> tuple[pd.DataFrame, float]:
@@ -1067,7 +1207,7 @@ def recursive_forecast(
 
 
 def main() -> int:
-    global P_ORDER_BLEND_LAMBDA, P_ORDER_PRIOR_K
+    global P_ORDER_BLEND_LAMBDA, P_ORDER_PRIOR_K, ORDER_PROB_THRESHOLD
 
     ensure_report_dirs()
     use_gpu = want_gpu("HURDLE")
@@ -1136,10 +1276,42 @@ def main() -> int:
     log("Training hurdle on sliding Jan-Feb horizons...")
     clf_val, reg_val, clf_b, reg_b = fit_hurdle(X_train, y_train, w_train, use_gpu=use_gpu)
 
+    y_bin_valid = (y_valid.values > 0).astype(int)
+    p_raw_valid = raw_p_order(clf_val, X_valid, clf_backend=clf_b)
+    prob_calibrator = fit_probability_calibrator(p_raw_valid, y_bin_valid)
+    p_cal_valid = apply_probability_calibrator(prob_calibrator, p_raw_valid)
+    log(
+        "  P(order) isotonic calibration on March validation: "
+        f"raw_mean={p_raw_valid.mean():.4f} cal_mean={p_cal_valid.mean():.4f} "
+        f"frac_cal>=0.5={float((p_cal_valid >= 0.5).mean()):.4f}"
+    )
+
     log("Tuning P(order) prior blend on March sliding validation...")
     blend_lam, prior_k = tune_prior_hyperparams(
-        clf_val, reg_val, valid_open, feat_cols, clf_backend=clf_b, reg_backend=reg_b
+        clf_val,
+        reg_val,
+        valid_open,
+        feat_cols,
+        clf_backend=clf_b,
+        reg_backend=reg_b,
+        prob_calibrator=prob_calibrator,
     )
+    P_ORDER_BLEND_LAMBDA = blend_lam
+    P_ORDER_PRIOR_K = prior_k
+
+    log("Tuning hard-hurdle order threshold on March validation...")
+    order_tau = tune_order_prob_threshold(
+        clf_val,
+        reg_val,
+        valid_open,
+        feat_cols,
+        blend_lambda=blend_lam,
+        prior_k=prior_k,
+        clf_backend=clf_b,
+        reg_backend=reg_b,
+        prob_calibrator=prob_calibrator,
+    )
+    ORDER_PROB_THRESHOLD = order_tau
 
     pred_val, p_val, mu_val = predict_hurdle(
         clf_val,
@@ -1150,6 +1322,8 @@ def main() -> int:
         prior_k=prior_k,
         clf_backend=clf_b,
         reg_backend=reg_b,
+        prob_calibrator=prob_calibrator,
+        order_threshold=order_tau,
     )
 
     log("Validation (regression, daily, hard hurdle):")
@@ -1170,12 +1344,17 @@ def main() -> int:
     )
 
     y_bin = (y_valid.values > 0).astype(int)
-    log("Validation (classifier, raw proba for diagnostics):")
-    if clf_b == "xgboost_cuda":
-        p_raw_val = predict_proba_positive(clf_val, clf_b, X_valid.to_numpy(dtype=np.float64))
-    else:
-        p_raw_val = clf_val.predict_proba(X_valid)[:, 1]
-    clf_metrics = evaluate_classifier(y_bin, p_raw_val)
+    log("Validation (classifier, raw vs calibrated proba):")
+    clf_metrics = evaluate_classifier(y_bin, p_raw_valid)
+    clf_metrics_cal = evaluate_classifier(y_bin, p_cal_valid)
+    log(
+        f"  [raw] log_loss={clf_metrics['log_loss']:.4f}  brier={clf_metrics['brier']:.4f}  "
+        f"roc_auc={clf_metrics['roc_auc']:.4f}"
+    )
+    log(
+        f"  [cal] log_loss={clf_metrics_cal['log_loss']:.4f}  brier={clf_metrics_cal['brier']:.4f}  "
+        f"roc_auc={clf_metrics_cal['roc_auc']:.4f}"
+    )
 
     diag = valid_open[ID_COLS + ["customer_id", "date", "qty_ea"]].copy()
     diag["pred"] = np.clip(pred_val, 0, None)
@@ -1320,8 +1499,11 @@ def main() -> int:
         {"metric": "Q_Jan", "value": q_stats["Q_Jan"]},
         {"metric": "Q_Mar", "value": q_stats["Q_Mar"]},
         {"metric": "Q_target", "value": q_stats["Q_target"]},
-        {"metric": "P_order_blend_lambda", "value": P_ORDER_BLEND_LAMBDA},
-        {"metric": "P_order_prior_k", "value": P_ORDER_PRIOR_K},
+        {"metric": "P_order_blend_lambda", "value": blend_lam},
+        {"metric": "P_order_prior_k", "value": prior_k},
+        {"metric": "P_order_calibrated_mean", "value": float(p_cal_valid.mean())},
+        {"metric": "P_order_raw_mean", "value": float(p_raw_valid.mean())},
+        {"metric": "reg_qty_weight_power", "value": float(REG_QTY_WEIGHT_POWER)},
         {"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)},
         {"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)},
         {"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)},
@@ -1347,6 +1529,16 @@ def main() -> int:
         use_gpu=use_gpu,
     )
 
+    p_raw_full_valid = raw_p_order(clf_full, X_valid, clf_backend=clf_bf)
+    prob_calibrator_full = fit_probability_calibrator(p_raw_full_valid, y_bin_valid)
+    if prob_calibrator_full is not None:
+        prob_calibrator = prob_calibrator_full
+        p_cal_full = apply_probability_calibrator(prob_calibrator, p_raw_full_valid)
+        log(
+            "  Refit P(order) calibrator on full model: "
+            f"cal_mean={p_cal_full.mean():.4f}  frac>=0.5={float((p_cal_full >= 0.5).mean()):.4f}"
+        )
+
     def predict_hurdle_batch(batch: pd.DataFrame) -> np.ndarray:
         b = batch.merge(tuple_priors, on=ID_COLS, how="left")
         b["pos_rate_train"] = b["pos_rate_train"].fillna(0.03)
@@ -1355,10 +1547,12 @@ def main() -> int:
             reg_full,
             b[feat_cols].fillna(0.0),
             b["pos_rate_train"].values,
-            blend_lambda=P_ORDER_BLEND_LAMBDA,
-            prior_k=P_ORDER_PRIOR_K,
+            blend_lambda=blend_lam,
+            prior_k=prior_k,
             clf_backend=clf_bf,
             reg_backend=reg_bf,
+            prob_calibrator=prob_calibrator,
+            order_threshold=order_tau,
         )
         return pred
 
@@ -1401,8 +1595,8 @@ def main() -> int:
             {"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)},
             {"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)},
             {"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)},
-            {"metric": "P_order_blend_lambda", "value": P_ORDER_BLEND_LAMBDA},
-            {"metric": "P_order_prior_k", "value": P_ORDER_PRIOR_K},
+            {"metric": "P_order_blend_lambda", "value": blend_lam},
+            {"metric": "P_order_prior_k", "value": prior_k},
         ]
     ).to_csv(HURDLE_APRIL_CALIBRATION, index=False, encoding="utf-8-sig")
     pd.DataFrame(
