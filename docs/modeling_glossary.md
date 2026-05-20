@@ -113,7 +113,7 @@ All metrics compare **actual** `qty_ea` to **predicted** `qty_ea`. Lower is usua
 
 ### 2. Hurdle — classifier × size on sliding rows
 
-- **P(order)** from a classifier; **μ** from a Poisson regressor on positive training rows; **pred = P × μ**.
+- **P(order)** from a classifier; **μ** from a Poisson regressor on positive training rows; **pred = μ** if `P(order) >= 0.5`, else **0** (hard hurdle).
 - Same sliding April chaining as baseline.
 - **Grain:** warehouse × store × product.
 

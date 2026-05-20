@@ -4,7 +4,7 @@ Grain: (warehouse, store, product_id) x day.
 
 - **Lookback:** 14 warehouse-open days (CNY closure skipped).
 - **Horizon:** next 7 calendar days; slide forward 7 days.
-- **Model:** classifier P(order) x Poisson size; trained on sliding samples.
+- **Model:** classifier P(order) + Poisson size μ; pred = μ if P(order) >= 0.5 else 0.
 - **April:** same weekly sliding forecast (predictions extend the lookback).
 """
 
@@ -40,7 +40,6 @@ from _metrics import (
     bias_ratio,
     evaluate_arrays,
     evaluate_arrays_positive_actual,
-    evaluate_decision_hurdle_qty,
     intermittent_hurdle_loss_report,
     smape_fracs,
     wmape,
@@ -144,7 +143,10 @@ def write_hurdle_daily_csv(
     ]
     base = daily_fc.drop(columns=extra, errors="ignore")
     out = base.merge(name_lookup, on=ID_COLS, how="left")
-    out.to_csv(path, index=False, encoding="utf-8-sig")
+    try:
+        out.to_csv(path, index=False, encoding="utf-8-sig")
+    except PermissionError:
+        log(f"WARNING: could not write {path.name} (file locked?); skipping")
 
 
 def tuple_recursive_priors(panel: pd.DataFrame) -> pd.DataFrame:
@@ -774,7 +776,8 @@ def predict_hurdle(
         p_prior = np.clip(pr * k, P_ORDER_MIN, pr)
         p = (1.0 - lam) * p_raw + lam * p_prior
         p = np.clip(p, 0.0, 1.0)
-    pred = np.clip(p * mu, 0, None)
+    order = (p >= ORDER_PROB_THRESHOLD).astype(np.float64)
+    pred = np.clip(order * mu, 0, None)
     return pred, p, mu
 
 
@@ -790,9 +793,8 @@ def tune_prior_hyperparams(
     """Pick (blend_lambda, prior_k) from March validation.
 
     Primary objective: monthly tuple totals bias_ratio nearest 1.
-    Secondary (tie-break / gentle pull): lower decision-rule SMAPE on daily rows
-    (``pred_qty`` if ``p_order >= ORDER_PROB_THRESHOLD`` else 0), which better reflects
-    intermittent demand than dense-panel expectation SMAPE.
+    Secondary (tie-break / gentle pull): lower hard-hurdle SMAPE on daily rows
+    (same rule as ``predict_hurdle``: μ if P(order) >= threshold else 0).
     """
     X = valid_open[feat_cols].fillna(0.0)
     pr = valid_open["pos_rate_train"].values
@@ -824,9 +826,7 @@ def tune_prior_hyperparams(
                 continue
             br = bias_ratio(merged["actual"].values, merged["pred"].values)
             br_err = abs(br - 1.0)
-            sm_dec = evaluate_decision_hurdle_qty(
-                y_daily, pred, p_ord, ORDER_PROB_THRESHOLD
-            )["smape"]
+            sm_dec = evaluate_arrays(y_daily, pred)["smape"]
             score = br_err + PRIOR_TUNE_DECISION_SMAPE_WEIGHT * sm_dec
             if score < best_score - 1e-9 or (
                 abs(score - best_score) <= 1e-9 and br_err < best_br_err
@@ -837,7 +837,7 @@ def tune_prior_hyperparams(
 
     log(
         f"  tuned P(order) blend: lambda={best_lam:.2f}  prior_k={best_k:.2f}  "
-        f"(score=monthly|bias_ratio-1|+{PRIOR_TUNE_DECISION_SMAPE_WEIGHT}*decision_SMAPE "
+        f"(score=monthly|bias_ratio-1|+{PRIOR_TUNE_DECISION_SMAPE_WEIGHT}*hard_SMAPE "
         f"→ {best_score:.4f}; monthly |bias_ratio-1| alone → {best_br_err:.4f})"
     )
     return best_lam, best_k
@@ -1148,18 +1148,15 @@ def main() -> int:
         reg_backend=reg_b,
     )
 
-    log("Validation (regression, daily):")
-    overall = evaluate_reg("overall_daily_dense_panel", y_valid.values, pred_val)
+    log("Validation (regression, daily, hard hurdle):")
+    overall = evaluate_reg(
+        f"overall_daily_hard_hurdle (p_order>={ORDER_PROB_THRESHOLD})",
+        y_valid.values,
+        pred_val,
+    )
 
     pos_m, n_pos = evaluate_arrays_positive_actual(y_valid.values, pred_val)
     evaluate_reg_masked(f"overall_daily_actual_gt0_only (n={n_pos:,})", pos_m)
-
-    hard_m = evaluate_decision_hurdle_qty(
-        y_valid.values, pred_val, p_val, ORDER_PROB_THRESHOLD
-    )
-    evaluate_reg_masked(
-        f"overall_daily_decision_sparse (p_order>={ORDER_PROB_THRESHOLD})", hard_m
-    )
 
     sf = smape_fracs(y_valid.values, pred_val)
     log(
@@ -1251,9 +1248,6 @@ def main() -> int:
         {"metric": f"daily_actual_gt0_{k}", "value": v} for k, v in pos_m.items()
     ]
     cal_rows += [
-        {"metric": f"daily_decision_sparse_{k}", "value": v} for k, v in hard_m.items()
-    ]
-    cal_rows += [
         {"metric": "daily_n_actual_gt0", "value": float(n_pos)},
         {"metric": "dense_frac_y0_pred_pos", "value": sf["frac_y0_pred_pos"]},
         {"metric": "dense_frac_both_zero", "value": sf["frac_both_zero"]},
@@ -1338,9 +1332,12 @@ def main() -> int:
         ID_COLS + ["customer_id", "product_name", "temperature_zone"]
     ].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
-    write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_PATTERN, name_lookup)
-    write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_STORE, name_lookup)
-    write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_NETWORK, name_lookup)
+    for path in (
+        HURDLE_APRIL_DAILY_NETWORK,
+        HURDLE_APRIL_DAILY_STORE,
+        HURDLE_APRIL_DAILY_PATTERN,
+    ):
+        write_hurdle_daily_csv(daily_fc, path, name_lookup)
     log(
         f"  Wrote April daily (sliding, all tiers identical): {HURDLE_DAILY_PATTERN_CSV}, "
         f"{HURDLE_DAILY_STORE_CSV}, {HURDLE_DAILY_NETWORK_CSV}"

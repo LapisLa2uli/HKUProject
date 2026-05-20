@@ -258,7 +258,7 @@ All three models call the same CNY utilities so holiday shutdowns do not look li
 | **Classifier** | `1{qty_ea > 0}` on each horizon day | `HistGradientBoostingClassifier` |
 | **Size regressor** | `qty_ea` where actual > 0 | `HistGradientBoostingRegressor`, Poisson loss |
 
-**Combined prediction:** `pred = P(order) × μ` with optional **prior blend** on `P(order)` tuned on March sliding validation (`tuple_recursive_priors`: Jan–Feb order-day rate per tuple).
+**Combined prediction:** `pred = μ` if `P(order) >= 0.5`, else `0` (hard hurdle); optional **prior blend** on `P(order)` tuned on March sliding validation (`tuple_recursive_priors`: Jan–Feb order-day rate per tuple).
 
 #### Train / validate / forecast
 
