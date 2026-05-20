@@ -85,6 +85,18 @@ All metrics compare **actual** `qty_ea` to **predicted** `qty_ea`. Lower is usua
 
 **Caveat for intermittent data:** On a dense panel with many zero days, **SMAPE** can look bad even when predicted values are tiny, because any positive prediction on a zero day counts as a large percentage error. Prefer **MAE on order days**, **monthly WMAPE**, or the hurdle’s **decision-rule** metrics when demand is sparse.
 
+### Store planning loss (timing-tolerant)
+
+Used in hurdle and store-regression **March validation** (`src/_metrics.py`). For each **store**, actual order lines (product + day + qty) are matched to predicted order lines with the **same product** and date within **±2 days**. Day slip inside that window adds **no extra penalty**.
+
+| Component | Meaning |
+|-----------|---------|
+| **Planning window loss** | Penalizes wrong/missing **product** and **quantity**; ignores 1–2 day timing slip when product and amount match. **Lower is better.** |
+| **Strict daily WMAPE** | Same-day store×product×day error (timing matters fully). Reported for comparison. |
+| **Composite planning loss** | 75% window loss + 25% strict daily WMAPE. |
+
+Example: predicting the right SKU and ~right qty **two days early** scores better than predicting the **correct day** with the **wrong SKU** or **wrong qty**.
+
 ---
 
 ## Model building blocks

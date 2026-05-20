@@ -23,7 +23,7 @@ if str(_SRC) not in sys.path:
 
 from _cny import add_cny_features, detect_warehouse_closure
 from _gbdt_gpu import fit_regressor, predict as gbdt_predict, want_gpu
-from _metrics import bias_ratio, evaluate_arrays, wmape
+from _metrics import bias_ratio, evaluate_arrays, store_planning_loss_report, wmape
 from _sliding_window import (
     HORIZON_DAYS,
     LOOKBACK_OPEN_DAYS,
@@ -43,6 +43,7 @@ from _report_paths import (
     STORE_REG_VALIDATION_OVERALL,
     STORE_REG_VALIDATION_PER_CUSTOMER,
     STORE_REG_VALIDATION_PER_WAREHOUSE,
+    STORE_REG_VALIDATION_PLANNING,
     ensure_report_dirs,
 )
 
@@ -64,6 +65,9 @@ HISTORY_SPAN = max(LAG_DAYS) + max(ROLL_WINDOWS)
 MIN_NONZERO_DAYS_TRAIN = 3
 
 ID_COLS = ["warehouse", "store", "product_id"]
+STORE_KEYS = ["warehouse", "customer_id", "store"]
+PLANNING_MATCH_WINDOW_DAYS = 2
+PLANNING_QTY_REL_TOL = 0.15
 CATEGORICAL_RAW = ID_COLS + ["customer_id", "temperature_zone"]
 CATEGORICAL_ENC = [f"{c}_enc" for c in CATEGORICAL_RAW]
 
@@ -553,6 +557,31 @@ def main() -> int:
     bias_m = bias_ratio(monthly["actual"].values, monthly["pred"].values)
     log(f"  monthly WMAPE={wmape_m:.4f}  bias_ratio={bias_m:+.4f}")
 
+    log(
+        "Store planning loss (product+qty within "
+        f"±{PLANNING_MATCH_WINDOW_DAYS}d; timing slip unpunished in window)..."
+    )
+    ploss = store_planning_loss_report(
+        diag,
+        store_keys=STORE_KEYS,
+        window_days=PLANNING_MATCH_WINDOW_DAYS,
+        qty_rel_tol=PLANNING_QTY_REL_TOL,
+    )
+    log(
+        f"  planning_window_loss={ploss.get('planning_window_loss', float('nan')):.4f}  "
+        f"strict_daily_wmape={ploss.get('strict_daily_wmape', float('nan')):.4f}  "
+        f"composite={ploss.get('composite_planning_loss', float('nan')):.4f}  "
+        f"matched_vol={ploss.get('matched_volume_rate', float('nan')):.3f}"
+    )
+    ploss_rows = [
+        {"metric": k, "value": v}
+        for k, v in ploss.items()
+        if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+    ]
+    pd.DataFrame(ploss_rows).to_csv(
+        STORE_REG_VALIDATION_PLANNING, index=False, encoding="utf-8-sig"
+    )
+
     per_wh.to_csv(STORE_REG_VALIDATION_PER_WAREHOUSE, index=False, encoding="utf-8-sig")
     per_cust.to_csv(STORE_REG_VALIDATION_PER_CUSTOMER, index=False, encoding="utf-8-sig")
     monthly.to_csv(STORE_REG_VALIDATION_MONTHLY, index=False, encoding="utf-8-sig")
@@ -560,6 +589,12 @@ def main() -> int:
         [{"metric": f"daily_{k}", "value": v} for k, v in overall.items()]
         + [{"metric": f"monthly_{k}", "value": v} for k, v in monthly_overall.items()]
         + [{"metric": "monthly_wmape", "value": wmape_m}, {"metric": "monthly_bias_ratio", "value": bias_m}]
+        + [
+            {"metric": "planning_window_loss", "value": float(ploss.get("planning_window_loss", float("nan")))},
+            {"metric": "planning_composite_loss", "value": float(ploss.get("composite_planning_loss", float("nan")))},
+            {"metric": "planning_strict_daily_wmape", "value": float(ploss.get("strict_daily_wmape", float("nan")))},
+            {"metric": "planning_match_window_days", "value": float(PLANNING_MATCH_WINDOW_DAYS)},
+        ]
         + [{"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)}]
         + [{"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)}]
         + [{"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)}]

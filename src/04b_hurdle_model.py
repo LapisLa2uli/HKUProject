@@ -42,6 +42,7 @@ from _metrics import (
     evaluate_arrays_positive_actual,
     intermittent_hurdle_loss_report,
     smape_fracs,
+    store_planning_loss_report,
     wmape,
 )
 from _sliding_window import (
@@ -68,6 +69,7 @@ from _report_paths import (
     HURDLE_APRIL_STORE_CALIBRATION,
     HURDLE_VALIDATION_CLASSIFIER,
     HURDLE_VALIDATION_INTERMITTENT,
+    HURDLE_VALIDATION_PLANNING,
     HURDLE_VALIDATION_MONTHLY,
     HURDLE_VALIDATION_OVERALL,
     HURDLE_VALIDATION_PER_CUSTOMER,
@@ -99,6 +101,8 @@ CATEGORICAL_RAW = ID_COLS + ["customer_id", "temperature_zone"]
 CATEGORICAL_ENC = [f"{c}_enc" for c in CATEGORICAL_RAW]
 
 ORDER_PROB_THRESHOLD = 0.5
+PLANNING_MATCH_WINDOW_DAYS = 2
+PLANNING_QTY_REL_TOL = 0.15
 
 # P(order): blend classifier proba with empirical prior (tuned on March validation).
 P_ORDER_BLEND_LAMBDA = 0.10
@@ -1203,6 +1207,34 @@ def main() -> int:
         HURDLE_VALIDATION_INTERMITTENT, index=False, encoding="utf-8-sig"
     )
 
+    log(
+        "Validation (store planning loss — product+qty within "
+        f"±{PLANNING_MATCH_WINDOW_DAYS}d; timing slip unpunished in window)..."
+    )
+    ploss = store_planning_loss_report(
+        diag,
+        store_keys=STORE_KEYS,
+        window_days=PLANNING_MATCH_WINDOW_DAYS,
+        qty_rel_tol=PLANNING_QTY_REL_TOL,
+        min_pred_qty=0.0,
+    )
+    log(
+        f"  stores={ploss.get('n_stores', 0):,}  "
+        f"planning_window_loss={ploss.get('planning_window_loss', float('nan')):.4f}  "
+        f"strict_daily_wmape={ploss.get('strict_daily_wmape', float('nan')):.4f}  "
+        f"composite={ploss.get('composite_planning_loss', float('nan')):.4f}  "
+        f"matched_vol={ploss.get('matched_volume_rate', float('nan')):.3f}  "
+        f"mean_|day_slip|={ploss.get('mean_abs_day_slip_matched', float('nan')):.2f}"
+    )
+    ploss_rows = [
+        {"metric": k, "value": v}
+        for k, v in ploss.items()
+        if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+    ]
+    pd.DataFrame(ploss_rows).to_csv(
+        HURDLE_VALIDATION_PLANNING, index=False, encoding="utf-8-sig"
+    )
+
     per_wh = diag.groupby("warehouse", observed=True)[["qty_ea", "pred"]].apply(
         lambda g: pd.Series(evaluate_arrays(g["qty_ea"].values, g["pred"].values)),
     ).reset_index()
@@ -1264,6 +1296,22 @@ def main() -> int:
         {
             "metric": "intermittent_segment_volume_wmape",
             "value": float(iloss.get("segment_volume_wmape", float("nan"))),
+        },
+        {
+            "metric": "planning_window_loss",
+            "value": float(ploss.get("planning_window_loss", float("nan"))),
+        },
+        {
+            "metric": "planning_composite_loss",
+            "value": float(ploss.get("composite_planning_loss", float("nan"))),
+        },
+        {
+            "metric": "planning_strict_daily_wmape",
+            "value": float(ploss.get("strict_daily_wmape", float("nan"))),
+        },
+        {
+            "metric": "planning_match_window_days",
+            "value": float(PLANNING_MATCH_WINDOW_DAYS),
         },
     ]
     cal_rows += [
