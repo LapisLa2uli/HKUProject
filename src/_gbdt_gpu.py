@@ -70,13 +70,21 @@ def fit_regressor(
     use_gpu: bool,
     num_boost_round: int = 600,
     params: dict[str, Any] | None = None,
+    existing_model: Any | None = None,
+    num_boost_round_add: int | None = None,
 ) -> tuple[Any, str]:
+    rounds = num_boost_round_add if num_boost_round_add is not None else num_boost_round
     if use_gpu:
         import xgboost as xgb
 
         p = {**_REG_DEFAULTS, "device": "cuda", **(params or {})}
         dtrain = xgb.DMatrix(_as_float32(X), label=y.astype(np.float32), weight=sample_weight)
-        booster = xgb.train(p, dtrain, num_boost_round=num_boost_round)
+        booster = xgb.train(
+            p,
+            dtrain,
+            num_boost_round=rounds,
+            xgb_model=existing_model,
+        )
         return booster, "xgboost_cuda"
     from sklearn.ensemble import HistGradientBoostingRegressor
 
@@ -102,7 +110,10 @@ def fit_classifier(
     use_gpu: bool,
     num_boost_round: int = 200,
     params: dict[str, Any] | None = None,
+    existing_model: Any | None = None,
+    num_boost_round_add: int | None = None,
 ) -> tuple[Any, str]:
+    rounds = num_boost_round_add if num_boost_round_add is not None else num_boost_round
     if use_gpu:
         import xgboost as xgb
 
@@ -110,7 +121,12 @@ def fit_classifier(
         dtrain = xgb.DMatrix(
             _as_float32(X), label=y.astype(np.float32), weight=sample_weight
         )
-        booster = xgb.train(p, dtrain, num_boost_round=num_boost_round)
+        booster = xgb.train(
+            p,
+            dtrain,
+            num_boost_round=rounds,
+            xgb_model=existing_model,
+        )
         return booster, "xgboost_cuda"
     from sklearn.ensemble import HistGradientBoostingClassifier
 

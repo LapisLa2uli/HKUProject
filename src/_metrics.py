@@ -86,6 +86,38 @@ def bias_ratio(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float((np.sum(y_pred) - a) / a)
 
 
+def sliding_horizon_block_wmape(
+    df: pd.DataFrame,
+    pred: np.ndarray,
+    *,
+    id_cols: list[str],
+    anchor_col: str = "anchor_date",
+    y_col: str = "qty_ea",
+    open_only: bool = True,
+) -> dict[str, float]:
+    """WMAPE on 7-day blocks: each (tuple × anchor) sums actual/pred over the horizon."""
+    d = df.copy()
+    d["_pred"] = np.clip(np.asarray(pred, dtype=np.float64), 0, None)
+    if open_only and "is_warehouse_closed" in d.columns:
+        d = d[d["is_warehouse_closed"].fillna(0).astype(int) != 1]
+    if d.empty:
+        return {"block_wmape": float("nan"), "row_wmape": float("nan"), "n_blocks": 0.0}
+
+    keys = id_cols + [anchor_col]
+    blk = (
+        d.groupby(keys, observed=True)
+        .agg(actual=(y_col, "sum"), pred=("_pred", "sum"))
+        .reset_index()
+    )
+    row_w = wmape(d[y_col].to_numpy(dtype=np.float64), d["_pred"].to_numpy(dtype=np.float64))
+    blk_w = wmape(blk["actual"].to_numpy(dtype=np.float64), blk["pred"].to_numpy(dtype=np.float64))
+    return {
+        "block_wmape": float(blk_w),
+        "row_wmape": float(row_w),
+        "n_blocks": float(len(blk)),
+    }
+
+
 def intermittent_hurdle_loss_report(
     df: pd.DataFrame,
     *,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,7 @@ from _metrics import (
     evaluate_arrays,
     evaluate_arrays_positive_actual,
     intermittent_hurdle_loss_report,
+    sliding_horizon_block_wmape,
     smape_fracs,
     store_planning_loss_report,
     wmape,
@@ -71,6 +73,7 @@ from _report_paths import (
     HURDLE_VALIDATION_CLASSIFIER,
     HURDLE_VALIDATION_INTERMITTENT,
     HURDLE_VALIDATION_PLANNING,
+    HURDLE_TRAINING_MONITOR,
     HURDLE_VALIDATION_MONTHLY,
     HURDLE_VALIDATION_OVERALL,
     HURDLE_VALIDATION_PER_CUSTOMER,
@@ -110,7 +113,12 @@ P_ORDER_BLEND_LAMBDA = 0.10
 P_ORDER_PRIOR_K = 0.35
 P_ORDER_MIN = 8e-5
 # Up-weight large order days when fitting the size (μ) regressor: weight *= qty^power.
-REG_QTY_WEIGHT_POWER = 0.5
+REG_QTY_WEIGHT_POWER = 1.0
+TRAIN_MONITOR_STEP_ROUNDS = 50
+TRAIN_MONITOR_CLF_ROUNDS = 200
+TRAIN_MONITOR_REG_ROUNDS = 450
+TRAIN_CONVERGENCE_REL_TOL = 0.005
+TRAIN_CONVERGENCE_PATIENCE = 3
 ROLL_QTY_MIN_FRAC_SEED = 0.35  # rolling buffer qty >= max(pred, frac * seed_qty)
 # When tuning prior blend: tiny weight on decision-rule SMAPE (see tune_prior_hyperparams).
 PRIOR_TUNE_DECISION_SMAPE_WEIGHT = 0.04
@@ -760,12 +768,266 @@ def raw_p_order(
     return clf.predict_proba(X_arr)[:, 1]
 
 
+@dataclass
+class HurdleTrainMonitor:
+    """Track sliding 14d→7d horizon loss on a held-out sample frame during training."""
+
+    valid_frame: pd.DataFrame
+    feat_cols: list[str]
+    id_cols: list[str]
+    pos_rate_train: np.ndarray
+    monitor_tau: float = 0.15
+    monitor_blend_lambda: float = 0.10
+    monitor_prior_k: float = 0.35
+    run_prefix: str = ""
+    history: list[dict[str, float | int | str]] = field(default_factory=list)
+
+    def sliding_horizon_loss(
+        self,
+        clf: object,
+        reg: object,
+        clf_backend: str,
+        reg_backend: str,
+    ) -> dict[str, float]:
+        pred, _, _ = predict_hurdle(
+            clf,
+            reg,
+            self.valid_frame[self.feat_cols].fillna(0.0),
+            self.pos_rate_train,
+            blend_lambda=self.monitor_blend_lambda,
+            prior_k=self.monitor_prior_k,
+            clf_backend=clf_backend,
+            reg_backend=reg_backend,
+            prob_calibrator=None,
+            order_threshold=self.monitor_tau,
+        )
+        return sliding_horizon_block_wmape(
+            self.valid_frame,
+            pred,
+            id_cols=self.id_cols,
+            anchor_col="anchor_date",
+        )
+
+    def record(
+        self,
+        phase: str,
+        round_n: int,
+        metrics: dict[str, float],
+        *,
+        clf_logloss: float | None = None,
+    ) -> None:
+        row: dict[str, float | int | str] = {
+            "phase": f"{self.run_prefix}{phase}",
+            "round": int(round_n),
+            "block_wmape": metrics.get("block_wmape", float("nan")),
+            "row_wmape": metrics.get("row_wmape", float("nan")),
+            "n_blocks": metrics.get("n_blocks", float("nan")),
+        }
+        if clf_logloss is not None:
+            row["clf_logloss"] = float(clf_logloss)
+        self.history.append(row)
+
+    def log_step(
+        self,
+        phase: str,
+        round_n: int,
+        metrics: dict[str, float],
+        prev_block: float | None,
+        *,
+        clf_logloss: float | None = None,
+    ) -> None:
+        blk = metrics.get("block_wmape", float("nan"))
+        delta = float("nan") if prev_block is None or not np.isfinite(prev_block) else blk - prev_block
+        msg = (
+            f"  [train monitor] {phase} round={round_n}  "
+            f"block_wmape={blk:.4f}  row_wmape={metrics.get('row_wmape', float('nan')):.4f}"
+        )
+        if np.isfinite(delta):
+            msg += f"  d_block={delta:+.4f}"
+        if clf_logloss is not None:
+            msg += f"  clf_logloss={clf_logloss:.4f}"
+        log(msg)
+        self.record(phase, round_n, metrics, clf_logloss=clf_logloss)
+
+
+def _convergence_status(
+    losses: list[float],
+    *,
+    rel_tol: float = TRAIN_CONVERGENCE_REL_TOL,
+    patience: int = TRAIN_CONVERGENCE_PATIENCE,
+) -> str:
+    if len(losses) < patience + 1:
+        return "still_training"
+    ref = losses[-patience - 1]
+    if not np.isfinite(ref) or ref <= 0:
+        return "still_training"
+    tail = losses[-patience:]
+    if all(abs(v - tail[0]) / ref < rel_tol for v in tail):
+        return "converged"
+    if all(losses[i] >= losses[i + 1] - rel_tol * ref for i in range(-patience, -1)):
+        return "improving_slowly"
+    return "still_training"
+
+
+def _train_classifier_staged(
+    X: np.ndarray,
+    y_bin: np.ndarray,
+    sample_weight: np.ndarray,
+    *,
+    use_gpu: bool,
+    total_rounds: int,
+    step_rounds: int,
+    clf_params: dict,
+    monitor: HurdleTrainMonitor | None,
+    X_valid: np.ndarray | None,
+    y_valid_bin: np.ndarray | None,
+) -> tuple[object, str]:
+    clf: object | None = None
+    clf_b = "xgboost_cuda" if use_gpu else "sklearn_cpu"
+    prev_blk: float | None = None
+    block_losses: list[float] = []
+
+    if use_gpu:
+        for cum in range(step_rounds, total_rounds + 1, step_rounds):
+            clf, clf_b = fit_classifier(
+                X,
+                y_bin,
+                sample_weight,
+                use_gpu=True,
+                params=clf_params,
+                existing_model=clf,
+                num_boost_round_add=step_rounds,
+            )
+            ll = float("nan")
+            if monitor is not None and X_valid is not None and y_valid_bin is not None:
+                p_v = raw_p_order(clf, X_valid, clf_backend=clf_b)
+                ll = float(log_loss(y_valid_bin, np.clip(p_v, 1e-6, 1 - 1e-6)))
+            if monitor is not None:
+                metrics = monitor.sliding_horizon_loss(clf, _ZeroRegressor(), clf_b, "sklearn_cpu")
+                blk = metrics.get("block_wmape", float("nan"))
+                block_losses.append(blk)
+                monitor.log_step("classifier", cum, metrics, prev_blk, clf_logloss=ll)
+                prev_blk = blk
+        if clf is None:
+            clf, clf_b = fit_classifier(X, y_bin, sample_weight, use_gpu=True, params=clf_params)
+        status = _convergence_status(block_losses)
+        if monitor is not None:
+            log(f"  [train monitor] classifier phase: {status}")
+        return clf, clf_b
+
+    clf = HistGradientBoostingClassifier(
+        loss="log_loss",
+        learning_rate=0.08,
+        max_iter=step_rounds,
+        max_leaf_nodes=48,
+        min_samples_leaf=80,
+        class_weight="balanced",
+        warm_start=True,
+        random_state=42,
+    )
+    for cum in range(step_rounds, total_rounds + 1, step_rounds):
+        clf.max_iter = cum
+        clf.fit(X, y_bin, sample_weight=sample_weight)
+        ll = float("nan")
+        if monitor is not None and X_valid is not None and y_valid_bin is not None:
+            p_v = clf.predict_proba(X_valid)[:, 1]
+            ll = float(log_loss(y_valid_bin, np.clip(p_v, 1e-6, 1 - 1e-6)))
+        if monitor is not None:
+            metrics = monitor.sliding_horizon_loss(clf, _ZeroRegressor(), "sklearn_cpu", "sklearn_cpu")
+            blk = metrics.get("block_wmape", float("nan"))
+            block_losses.append(blk)
+            monitor.log_step("classifier", cum, metrics, prev_blk, clf_logloss=ll)
+            prev_blk = blk
+    status = _convergence_status(block_losses)
+    if monitor is not None:
+        log(f"  [train monitor] classifier phase: {status}")
+    return clf, "sklearn_cpu"
+
+
+class _ZeroRegressor:
+    """Placeholder regressor for classifier-only monitor passes."""
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return np.zeros(len(X), dtype=np.float64)
+
+
+def _train_regressor_staged(
+    X: np.ndarray,
+    y_pos: np.ndarray,
+    reg_w: np.ndarray,
+    *,
+    use_gpu: bool,
+    total_rounds: int,
+    step_rounds: int,
+    reg_params: dict,
+    clf: object,
+    clf_b: str,
+    monitor: HurdleTrainMonitor | None,
+) -> tuple[object, str]:
+    reg: object | None = None
+    reg_b = "xgboost_cuda" if use_gpu else "sklearn_cpu"
+    prev_blk: float | None = None
+    block_losses: list[float] = []
+
+    if use_gpu:
+        for cum in range(step_rounds, total_rounds + 1, step_rounds):
+            reg, reg_b = fit_regressor(
+                X,
+                y_pos,
+                reg_w,
+                use_gpu=True,
+                params=reg_params,
+                existing_model=reg,
+                num_boost_round_add=step_rounds,
+            )
+            if monitor is not None:
+                metrics = monitor.sliding_horizon_loss(clf, reg, clf_b, reg_b)
+                blk = metrics.get("block_wmape", float("nan"))
+                block_losses.append(blk)
+                monitor.log_step("regressor", cum, metrics, prev_blk)
+                prev_blk = blk
+        if reg is None:
+            reg, reg_b = fit_regressor(X, y_pos, reg_w, use_gpu=True, params=reg_params)
+        status = _convergence_status(block_losses)
+        if monitor is not None:
+            log(f"  [train monitor] regressor phase: {status}")
+        return reg, reg_b
+
+    reg = HistGradientBoostingRegressor(
+        loss="poisson",
+        learning_rate=0.08,
+        max_iter=step_rounds,
+        max_leaf_nodes=63,
+        min_samples_leaf=80,
+        l2_regularization=0.0,
+        warm_start=True,
+        early_stopping=False,
+        random_state=42,
+    )
+    for cum in range(step_rounds, total_rounds + 1, step_rounds):
+        reg.max_iter = cum
+        reg.fit(X, y_pos, sample_weight=reg_w)
+        if monitor is not None:
+            metrics = monitor.sliding_horizon_loss(clf, reg, clf_b, "sklearn_cpu")
+            blk = metrics.get("block_wmape", float("nan"))
+            block_losses.append(blk)
+            monitor.log_step("regressor", cum, metrics, prev_blk)
+            prev_blk = blk
+    status = _convergence_status(block_losses)
+    if monitor is not None:
+        log(f"  [train monitor] regressor phase: {status}")
+    return reg, "sklearn_cpu"
+
+
 def fit_hurdle(
     X: pd.DataFrame | np.ndarray,
     y_qty: pd.Series | np.ndarray,
     sample_weight: np.ndarray,
     *,
     use_gpu: bool = False,
+    monitor: HurdleTrainMonitor | None = None,
+    X_valid_clf: np.ndarray | None = None,
+    y_valid_bin: np.ndarray | None = None,
 ) -> tuple[object, object, str, str]:
     if isinstance(X, pd.DataFrame):
         X_arr = X.to_numpy(dtype=np.float64)
@@ -774,6 +1036,45 @@ def fit_hurdle(
     y_arr = y_qty.to_numpy(dtype=np.float64) if isinstance(y_qty, pd.Series) else np.asarray(y_qty, dtype=np.float64)
     y_bin = (y_arr > 0).astype(np.int8)
     pos_w = _classifier_pos_weight(y_bin)
+    pos = y_bin == 1
+    reg_w = _regressor_qty_weights(
+        y_arr[pos],
+        sample_weight[pos] if sample_weight is not None else None,
+    )
+    clf_params = {"scale_pos_weight": pos_w}
+    reg_params = {"learning_rate": 0.08, "max_depth": 10}
+
+    if monitor is not None:
+        log(
+            f"  incremental training: step={TRAIN_MONITOR_STEP_ROUNDS}  "
+            f"clf_rounds={TRAIN_MONITOR_CLF_ROUNDS}  reg_rounds={TRAIN_MONITOR_REG_ROUNDS}  "
+            f"(loss = 7-day horizon WMAPE on March sliding samples, 14d lookback features)"
+        )
+        clf, clf_b = _train_classifier_staged(
+            X_arr,
+            y_bin,
+            sample_weight,
+            use_gpu=use_gpu,
+            total_rounds=TRAIN_MONITOR_CLF_ROUNDS,
+            step_rounds=TRAIN_MONITOR_STEP_ROUNDS,
+            clf_params=clf_params,
+            monitor=monitor,
+            X_valid=X_valid_clf,
+            y_valid_bin=y_valid_bin,
+        )
+        reg, reg_b = _train_regressor_staged(
+            X_arr[pos],
+            y_arr[pos],
+            reg_w,
+            use_gpu=use_gpu,
+            total_rounds=TRAIN_MONITOR_REG_ROUNDS,
+            step_rounds=TRAIN_MONITOR_STEP_ROUNDS,
+            reg_params=reg_params,
+            clf=clf,
+            clf_b=clf_b,
+            monitor=monitor,
+        )
+        return clf, reg, clf_b, reg_b
 
     if use_gpu:
         clf, clf_b = fit_classifier(
@@ -781,43 +1082,33 @@ def fit_hurdle(
             y_bin,
             sample_weight,
             use_gpu=True,
-            num_boost_round=200,
-            params={"scale_pos_weight": pos_w},
-        )
-        pos = y_bin == 1
-        reg_w = _regressor_qty_weights(
-            y_arr[pos],
-            sample_weight[pos] if sample_weight is not None else None,
+            num_boost_round=TRAIN_MONITOR_CLF_ROUNDS,
+            params=clf_params,
         )
         reg, reg_b = fit_regressor(
             X_arr[pos],
             y_arr[pos],
             reg_w,
             use_gpu=True,
-            num_boost_round=450,
-            params={"learning_rate": 0.08, "max_depth": 10},
+            num_boost_round=TRAIN_MONITOR_REG_ROUNDS,
+            params=reg_params,
         )
         return clf, reg, clf_b, reg_b
 
     clf = HistGradientBoostingClassifier(
         loss="log_loss",
         learning_rate=0.08,
-        max_iter=200,
+        max_iter=TRAIN_MONITOR_CLF_ROUNDS,
         max_leaf_nodes=48,
         min_samples_leaf=80,
         class_weight="balanced",
         random_state=42,
     )
     clf.fit(X_arr, y_bin, sample_weight=sample_weight)
-    pos = y_bin == 1
-    reg_w = _regressor_qty_weights(
-        y_arr[pos],
-        sample_weight[pos] if sample_weight is not None else None,
-    )
     reg = HistGradientBoostingRegressor(
         loss="poisson",
         learning_rate=0.08,
-        max_iter=450,
+        max_iter=TRAIN_MONITOR_REG_ROUNDS,
         max_leaf_nodes=63,
         min_samples_leaf=80,
         l2_regularization=0.0,
@@ -1272,11 +1563,28 @@ def main() -> int:
 
     X_valid = valid_open[feat_cols].fillna(0.0)
     y_valid = valid_open["qty_ea"].astype(float)
+    y_bin_valid = (y_valid.values > 0).astype(int)
+
+    train_monitor = HurdleTrainMonitor(
+        valid_frame=valid_open,
+        feat_cols=feat_cols,
+        id_cols=ID_COLS,
+        pos_rate_train=valid_open["pos_rate_train"].values,
+        monitor_tau=0.15,
+        run_prefix="val_",
+    )
 
     log("Training hurdle on sliding Jan-Feb horizons...")
-    clf_val, reg_val, clf_b, reg_b = fit_hurdle(X_train, y_train, w_train, use_gpu=use_gpu)
+    clf_val, reg_val, clf_b, reg_b = fit_hurdle(
+        X_train,
+        y_train,
+        w_train,
+        use_gpu=use_gpu,
+        monitor=train_monitor,
+        X_valid_clf=X_valid.to_numpy(dtype=np.float64),
+        y_valid_bin=y_bin_valid,
+    )
 
-    y_bin_valid = (y_valid.values > 0).astype(int)
     p_raw_valid = raw_p_order(clf_val, X_valid, clf_backend=clf_b)
     prob_calibrator = fit_probability_calibrator(p_raw_valid, y_bin_valid)
     p_cal_valid = apply_probability_calibrator(prob_calibrator, p_raw_valid)
@@ -1522,12 +1830,30 @@ def main() -> int:
         panel, ID_COLS, CATEGORICAL_ENC, static_enc, full_anchors, closure
     )
     w_full = sample_weights_sliding(full_df)
+    full_monitor = HurdleTrainMonitor(
+        valid_frame=valid_open,
+        feat_cols=feat_cols,
+        id_cols=ID_COLS,
+        pos_rate_train=valid_open["pos_rate_train"].values,
+        monitor_tau=order_tau,
+        monitor_blend_lambda=blend_lam,
+        monitor_prior_k=prior_k,
+        run_prefix="full_",
+        history=train_monitor.history,
+    )
     clf_full, reg_full, clf_bf, reg_bf = fit_hurdle(
         full_df[feat_cols].fillna(0.0),
         full_df["qty_ea"].astype(float),
         w_full,
         use_gpu=use_gpu,
+        monitor=full_monitor,
+        X_valid_clf=X_valid.to_numpy(dtype=np.float64),
+        y_valid_bin=y_bin_valid,
     )
+    pd.DataFrame(train_monitor.history).to_csv(
+        HURDLE_TRAINING_MONITOR, index=False, encoding="utf-8-sig"
+    )
+    log(f"  Wrote training monitor curve: {HURDLE_TRAINING_MONITOR.name}")
 
     p_raw_full_valid = raw_p_order(clf_full, X_valid, clf_backend=clf_bf)
     prob_calibrator_full = fit_probability_calibrator(p_raw_full_valid, y_bin_valid)

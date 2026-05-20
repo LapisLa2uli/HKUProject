@@ -33,6 +33,7 @@ HURDLE_VALIDATION_PER_CUSTOMER = HURDLE_DIR / "hurdle_validation_per_customer.cs
 HURDLE_VALIDATION_CLASSIFIER = HURDLE_DIR / "hurdle_validation_classifier.csv"
 HURDLE_VALIDATION_INTERMITTENT = HURDLE_DIR / "hurdle_validation_intermittent_loss.csv"
 HURDLE_VALIDATION_PLANNING = HURDLE_DIR / "hurdle_validation_planning_loss.csv"
+HURDLE_TRAINING_MONITOR = HURDLE_DIR / "hurdle_training_monitor.csv"
 HURDLE_APRIL_DAILY_PATTERN = HURDLE_DIR / "april_forecast_hurdle_daily_pattern.csv"
 HURDLE_APRIL_DAILY_STORE = HURDLE_DIR / "april_forecast_hurdle_daily_store.csv"
 HURDLE_APRIL_DAILY_NETWORK = HURDLE_DIR / "april_forecast_hurdle_daily.csv"

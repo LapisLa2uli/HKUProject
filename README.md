@@ -96,7 +96,7 @@ This section documents how data are split, how features are built, and how the b
 | **Validation** | Sliding samples whose horizon falls in **March**; compare to actuals (model fit on Jan–Feb only for the validation run). |
 | **April forecast** | Same sliding protocol, stepping **7 days** at a time; after each week, **predictions** are appended so the next lookback can use them. |
 | **Baseline** | One Poisson GBDT; sliding train/validate/forecast. |
-| **Hurdle** | Classifier × size regressor on sliding rows; same sliding April path. |
+| **Hurdle** | Classifier + size regressor on sliding rows; isotonic P(order) calibration, tuned prior blend & order threshold; store planning loss on validation. |
 | **Store regression** | One Poisson GBDT (optional GPU) on sliding rows; same sliding April path. |
 
 **Metrics (validation):** **MAE**, **WMAPE**, **bias ratio** — see [glossary](docs/modeling_glossary.md).
@@ -255,19 +255,34 @@ All three models call the same CNY utilities so holiday shutdowns do not look li
 
 | Part | Target | Model |
 |------|--------|--------|
-| **Classifier** | `1{qty_ea > 0}` on each horizon day | `HistGradientBoostingClassifier` |
-| **Size regressor** | `qty_ea` where actual > 0 | `HistGradientBoostingRegressor`, Poisson loss |
+| **Classifier** | `1{qty_ea > 0}` on each horizon day | XGBoost binary (CUDA) or `HistGradientBoostingClassifier`; **`scale_pos_weight`** for class imbalance |
+| **Size regressor** | `qty_ea` where actual > 0 | XGBoost Poisson (CUDA) or `HistGradientBoostingRegressor`; **quantity-weighted** fit (`weight × qty^0.5` on order days) |
 
-**Combined prediction:** `pred = μ` if `P(order) >= 0.5`, else `0` (hard hurdle); optional **prior blend** on `P(order)` tuned on March sliding validation (`tuple_recursive_priors`: Jan–Feb order-day rate per tuple).
+**Combined prediction (hard hurdle):**
+
+```text
+P_cal  = isotonic_calibrate(P_raw)     # fit on March validation scores
+P      = (1 − λ) × P_cal + λ × prior   # prior = pos_rate_train × k; λ, k tuned on March
+pred   = μ  if  P ≥ τ,  else 0         # τ = ORDER_PROB_THRESHOLD, tuned on March (not fixed 0.5)
+```
+
+Raw classifier scores are typically **well below 0.5** on this sparse panel; a fixed 0.5 cutoff suppresses almost all orders. **`tune_order_prob_threshold()`** picks τ to minimize March monthly |bias_ratio − 1| (recent runs: τ ≈ **0.15**).
+
+**Training / calibration constants** (top of `04b_hurdle_model.py`): `REG_QTY_WEIGHT_POWER` (linear qty weighting on the size regressor, default **1.0**), `PLANNING_MATCH_WINDOW_DAYS`, `P_ORDER_BLEND_LAMBDA` grid, `ORDER_PROB_THRESHOLD` search grid.
+
+**Training monitor:** During staged XGBoost training, every 50 rounds the model predicts the **next 7 open days** on March validation blocks (14-day lookback features already in each sliding row) and computes **block WMAPE** against actuals. Logs show `block_wmape`, `row_wmape`, step-to-step `d_block`, and a convergence label (`converged`, `improving_slowly`, etc.). Full curve written to `reports/hurdle/hurdle_training_monitor.csv` (validation + full retrain phases).
 
 #### Train / validate / forecast
 
 1. Build dense panel + CNY closure; `build_sliding_samples` for train (Jan–Feb horizons) and valid (March horizons).
-2. Fit hurdle; tune prior blend on March; write `reports/hurdle/hurdle_validation_*.csv` (daily, classifier, intermittent composite).
-3. Retrain on sliding samples through **March**; **`sliding_forecast_period`** for April with `predict_hurdle` on each batch.
-4. Write April dailies to `reports/hurdle/april_forecast_hurdle_daily_*.csv` (pattern / store / network filenames; **same sliding forecast** in current pipeline).
+2. Fit hurdle on train samples; **isotonic-calibrate** P(order) on March validation; **tune prior blend** (λ, k) and **order threshold** (τ) on March; write validation CSVs under `reports/hurdle/`:
+   - `hurdle_validation_overall.csv`, `hurdle_validation_monthly_*.csv`, classifier & intermittent loss
+   - **`hurdle_validation_planning_loss.csv`** — store-level loss that prioritizes **product type + quantity** over exact order day (±2 day window; see glossary)
+   - **`hurdle_training_monitor.csv`** — staged-training 7-day horizon block WMAPE curve (14-day lookback → predict 7 days vs actuals)
+3. Retrain on sliding samples through **March**; refit isotonic calibrator on the full model; **`sliding_forecast_period`** for April with tuned `predict_hurdle` (calibrator + λ, k, τ) on each batch.
+4. Write April dailies to `reports/hurdle/april_forecast_hurdle_daily_*.csv` (network / store / pattern filenames; **same sliding forecast** in current pipeline).
 
-**Note:** Legacy helpers (`pattern_forecast_april`, per-store/network calibration) remain in the file for reference but are **not** used by `main()`.
+**Note:** Legacy helpers (`pattern_forecast_april`, per-store/network **`calibrate_april_forecast`**) remain in the file for reference but are **not** applied in `main()` (April level is raw sliding output unless you re-enable calibration).
 
 ---
 
@@ -286,6 +301,8 @@ All three models call the same CNY utilities so holiday shutdowns do not look li
 #### Train / validate / forecast
 
 Same steps as baseline: sliding train (Jan–Feb horizons) → March validation → retrain through March → sliding April forecast.
+
+March validation also reports **store planning loss** (`src/_metrics.py`: `store_planning_loss_report`) — product + approximate quantity match within ±2 days per store; lower is better. Output: `reports/store_regression/store_regression_validation_planning_loss.csv`.
 
 **Performance:** sample building uses a **vectorized dense-panel** path in `_sliding_window.py` (typically seconds, not hours). Training uses **XGBoost CUDA** when available (`_gbdt_gpu.py`); force CPU with `STORE_REG_CPU=1`, `HURDLE_CPU=1`, or `BASELINE_CPU=1`.
 
