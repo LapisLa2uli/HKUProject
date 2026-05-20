@@ -1,16 +1,12 @@
 """Step 4: Baseline forecasting model for April demand.
 
 Modeling grain: (warehouse, customer_id, product_id) x day.
-No external data used here -- only history from Jan + Feb + Mar.
 
-Pipeline:
-    1) Build a dense daily panel for (warehouse, customer, product) tuples that
-       have at least ``MIN_NONZERO_DAYS_TRAIN`` non-zero days in Jan+Feb.
-    2) Engineer lag/rolling/calendar features (all using only past info).
-    3) Train HistGradientBoostingRegressor on (Jan+Feb), evaluate on Mar.
-    4) Re-train on (Jan+Feb+Mar), recursively forecast Apr 1-30.
-    5) Aggregate forecasts to monthly per (customer, product) and per
-       (warehouse, customer, product), and write report cards.
+Sliding protocol (see ``_sliding_window``):
+    - **Lookback:** last 14 warehouse-**open** days (CNY closure days skipped).
+    - **Horizon:** predict the next **7** calendar days; slide forward 7 days.
+    - **Train / validate:** samples whose 7-day horizon lies in Jan–Feb (train) or Mar (validate).
+    - **April:** same weekly sliding; after each week, predictions feed the next lookback.
 """
 
 from __future__ import annotations
@@ -21,19 +17,24 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingRegressor
-
 _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from _cny import (
-    add_cny_features,
-    detect_warehouse_closure,
-    make_sample_weights,
-    mask_qty_for_features,
+from _cny import add_cny_features, detect_warehouse_closure
+from _gbdt_gpu import fit_regressor, predict, want_gpu
+from _metrics import evaluate_arrays, wmape, bias_ratio
+from _sliding_window import (
+    HORIZON_DAYS,
+    LOOKBACK_OPEN_DAYS,
+    SLIDE_STEP_DAYS,
+    SLIDE_STEP_TRAIN_DAYS,
+    anchors_with_horizon_in,
+    build_sliding_samples,
+    sample_weights_sliding,
+    sliding_feature_columns,
+    sliding_forecast_period,
 )
-from _metrics import evaluate_arrays
 from _report_paths import (
     BASELINE_APRIL_DAILY,
     BASELINE_APRIL_MONTHLY_CP,
@@ -52,6 +53,7 @@ MARTS = PROCESSED / "marts"
 MODELS = PROJECT_ROOT / "models"
 MODELS.mkdir(parents=True, exist_ok=True)
 
+JAN_START = pd.Timestamp("2026-01-01")
 TRAIN_END = pd.Timestamp("2026-02-28")
 VALID_START = pd.Timestamp("2026-03-01")
 VALID_END = pd.Timestamp("2026-03-28")
@@ -107,6 +109,11 @@ def build_dense_panel(df: pd.DataFrame, history_end: pd.Timestamp) -> pd.DataFra
             temperature_zone=("temperature_zone", "first"),
         )
         .reset_index()
+    )
+
+    df = (
+        df.groupby(ID_COLS + ["date"], as_index=False, observed=True)["qty_ea"]
+        .sum()
     )
 
     history_start = df["date"].min()
@@ -202,22 +209,19 @@ def feature_columns() -> list[str]:
 
 
 def fit_model(
-    X: pd.DataFrame,
-    y: pd.Series,
+    X: np.ndarray | pd.DataFrame,
+    y: np.ndarray | pd.Series,
     sample_weight: np.ndarray | None = None,
-) -> HistGradientBoostingRegressor:
-    model = HistGradientBoostingRegressor(
-        loss="poisson",
-        learning_rate=0.06,
-        max_iter=600,
-        max_leaf_nodes=63,
-        min_samples_leaf=40,
-        l2_regularization=0.0,
-        early_stopping=False,
-        random_state=42,
-    )
-    model.fit(X, y, sample_weight=sample_weight)
-    return model
+    *,
+    use_gpu: bool | None = None,
+) -> tuple[object, str]:
+    if isinstance(X, pd.DataFrame):
+        X = X.to_numpy(dtype=np.float64)
+    if isinstance(y, pd.Series):
+        y = y.to_numpy(dtype=np.float64)
+    if use_gpu is None:
+        use_gpu = want_gpu("BASELINE")
+    return fit_regressor(X, y, sample_weight, use_gpu=use_gpu, num_boost_round=600)
 
 
 def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -229,53 +233,10 @@ def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, flo
     return metrics
 
 
-def recursive_forecast(
-    model: HistGradientBoostingRegressor,
-    panel: pd.DataFrame,
-    forecast_dates: pd.DatetimeIndex,
-    encoders: dict[str, dict[str, int]],
-    closure: pd.DataFrame,
-) -> pd.DataFrame:
-    feat_cols = feature_columns()
-
-    tuple_meta = (
-        panel[ID_COLS + ["temperature_zone"]]
-        .drop_duplicates(ID_COLS)
-        .reset_index(drop=True)
-    )
-
-    rolling = panel[ID_COLS + ["date", "qty_ea", "temperature_zone"]].copy()
-    out_rows: list[pd.DataFrame] = []
-
-    keep_from = forecast_dates.min() - pd.Timedelta(days=max(LAG_DAYS) + max(ROLL_WINDOWS))
-    rolling = rolling[rolling["date"] >= keep_from].copy()
-
-    for d in forecast_dates:
-        future = tuple_meta.copy()
-        future["date"] = d
-        future["qty_ea"] = 0.0
-        ext = pd.concat([rolling, future], ignore_index=True)
-        ext = add_cny_features(ext, closure)
-        ext["qty_ea_masked"] = mask_qty_for_features(ext)
-        ext = add_lag_features(ext)
-        ext = add_calendar(ext)
-        ext = apply_encoders(ext, encoders)
-        slice_d = ext[ext["date"] == d].copy()
-        X = slice_d[feat_cols].fillna(0.0)
-        preds = np.clip(model.predict(X), 0, None)
-        slice_d["qty_ea"] = preds
-        rolling = pd.concat(
-            [rolling, slice_d[ID_COLS + ["date", "qty_ea", "temperature_zone"]]],
-            ignore_index=True,
-        )
-        rolling = rolling[rolling["date"] >= d - pd.Timedelta(days=max(LAG_DAYS) + max(ROLL_WINDOWS))]
-        out_rows.append(slice_d[ID_COLS + ["date", "qty_ea"]])
-
-    return pd.concat(out_rows, ignore_index=True)
-
-
 def main() -> int:
     ensure_report_dirs()
+    use_gpu = want_gpu("BASELINE")
+    log(f"Training backend: {'XGBoost CUDA' if use_gpu else 'sklearn HistGradientBoosting (CPU)'}")
     log("Loading base panel...")
     raw = load_panel_base()
 
@@ -283,39 +244,55 @@ def main() -> int:
     panel = build_dense_panel(raw, HISTORY_END)
     log(f"  panel rows: {len(panel):,}  unique tuples: {panel.groupby(ID_COLS).ngroups:,}")
 
-    log("CNY closure + masked qty for features...")
+    log("CNY closure detection...")
     closure = detect_warehouse_closure(raw)
     panel = add_cny_features(panel, closure)
-    panel["qty_ea_masked"] = mask_qty_for_features(panel)
 
-    log("Adding calendar + lag features...")
-    panel_feat = add_lag_features(panel)
-    panel_feat = add_calendar(panel_feat)
+    encoders = build_encoders(panel)
+    static_enc = apply_encoders(
+        panel[ID_COLS + ["temperature_zone"]].drop_duplicates(ID_COLS),
+        encoders,
+    )
+    feat_cols = sliding_feature_columns(CATEGORICAL_ENC)
 
-    encoders = build_encoders(panel_feat)
-    panel_feat = apply_encoders(panel_feat, encoders)
+    train_anchors = anchors_with_horizon_in(
+        JAN_START, TRAIN_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    valid_anchors = anchors_with_horizon_in(
+        VALID_START, VALID_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    log(
+        f"Sliding windows: lookback={LOOKBACK_OPEN_DAYS} open days, "
+        f"horizon={HORIZON_DAYS}d, train_step={SLIDE_STEP_TRAIN_DAYS}d, "
+        f"april_step={SLIDE_STEP_DAYS}d"
+    )
+    log(f"  train anchors: {len(train_anchors)}  valid anchors: {len(valid_anchors)}")
 
-    feat_cols = feature_columns()
-    train_mask = panel_feat["date"] <= TRAIN_END
-    valid_mask = (panel_feat["date"] >= VALID_START) & (panel_feat["date"] <= VALID_END)
+    log("Building sliding training samples (Jan-Feb horizons)...")
+    train_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, train_anchors, closure
+    )
+    log(f"  train sample rows: {len(train_df):,}")
 
-    train_df = panel_feat.loc[train_mask].copy()
-    valid_df = panel_feat.loc[valid_mask].copy()
-    log(f"  train rows: {len(train_df):,}  valid rows: {len(valid_df):,}")
-
-    w_train = make_sample_weights(train_df)
+    w_train = sample_weights_sliding(train_df)
     X_train = train_df[feat_cols].fillna(0.0)
     y_train = train_df["qty_ea"].astype(float)
 
+    log("Building sliding validation samples (March horizons)...")
+    valid_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, valid_anchors, closure
+    )
     valid_open = valid_df[valid_df["is_warehouse_closed"] != 1].copy()
     X_valid = valid_open[feat_cols].fillna(0.0)
     y_valid = valid_open["qty_ea"].astype(float)
 
-    log("Training validation model (Jan+Feb -> Mar)...")
-    model_val = fit_model(X_train, y_train, sample_weight=w_train)
-    valid_pred = model_val.predict(X_valid)
+    log("Training validation model (sliding Jan-Feb -> Mar)...")
+    model_val, backend_val = fit_model(
+        X_train.to_numpy(dtype=np.float64), y_train.to_numpy(), sample_weight=w_train, use_gpu=use_gpu
+    )
+    valid_pred = predict(model_val, backend_val, X_valid.to_numpy(dtype=np.float64))
 
-    log("Validation metrics (open days only):")
+    log("Validation metrics (open March horizon days):")
     overall = evaluate("overall_daily", y_valid.values, valid_pred)
 
     diag = valid_open[ID_COLS + ["date", "qty_ea"]].copy()
@@ -340,6 +317,9 @@ def main() -> int:
         .reset_index()
     )
     monthly_overall = evaluate("monthly (wh,cust,prod)", monthly["actual"].values, monthly["pred"].values)
+    wmape_m = wmape(monthly["actual"].values, monthly["pred"].values)
+    bias_m = bias_ratio(monthly["actual"].values, monthly["pred"].values)
+    log(f"  monthly WMAPE={wmape_m:.4f}  bias_ratio={bias_m:+.4f}")
 
     per_wh.to_csv(BASELINE_VALIDATION_PER_WAREHOUSE, index=False, encoding="utf-8-sig")
     per_cust.to_csv(BASELINE_VALIDATION_PER_CUSTOMER, index=False, encoding="utf-8-sig")
@@ -347,18 +327,45 @@ def main() -> int:
     pd.DataFrame(
         [{"metric": f"daily_{k}", "value": v} for k, v in overall.items()]
         + [{"metric": f"monthly_{k}", "value": v} for k, v in monthly_overall.items()]
+        + [{"metric": "monthly_wmape", "value": wmape_m}, {"metric": "monthly_bias_ratio", "value": bias_m}]
+        + [{"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)}]
+        + [{"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)}]
+        + [{"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)}]
+        + [{"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)}]
+        + [{"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)}]
     ).to_csv(BASELINE_VALIDATION_OVERALL, index=False, encoding="utf-8-sig")
 
-    log("Retraining on full history (Jan+Feb+Mar) for April forecast...")
-    full_df = panel_feat.copy()
-    w_full = make_sample_weights(full_df)
-    X_full = full_df[feat_cols].fillna(0.0)
-    y_full = full_df["qty_ea"].astype(float)
-    model_full = fit_model(X_full, y_full, sample_weight=w_full)
+    log("Retraining on sliding samples through March (Jan-Mar horizons)...")
+    full_anchors = anchors_with_horizon_in(
+        JAN_START, HISTORY_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    full_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, full_anchors, closure
+    )
+    w_full = sample_weights_sliding(full_df)
+    model_full, backend_full = fit_model(
+        full_df[feat_cols].fillna(0.0).to_numpy(dtype=np.float64),
+        full_df["qty_ea"].to_numpy(dtype=np.float64),
+        sample_weight=w_full,
+        use_gpu=use_gpu,
+    )
 
-    log("Recursive forecast for April...")
-    forecast_dates = pd.date_range(FORECAST_START, FORECAST_END, freq="D")
-    daily_fc = recursive_forecast(model_full, panel, forecast_dates, encoders, closure)
+    log("Sliding April forecast (weekly blocks, predictions extend lookback)...")
+    april_anchors = anchors_with_horizon_in(FORECAST_START, FORECAST_END)
+
+    def _predict_batch(batch: pd.DataFrame) -> np.ndarray:
+        Xb = batch[feat_cols].fillna(0.0).to_numpy(dtype=np.float64)
+        return predict(model_full, backend_full, Xb)
+
+    daily_fc = sliding_forecast_period(
+        panel,
+        ID_COLS,
+        CATEGORICAL_ENC,
+        static_enc,
+        april_anchors,
+        _predict_batch,
+        closure,
+    )
 
     name_lookup = panel[ID_COLS + ["product_name", "temperature_zone"]].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")

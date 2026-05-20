@@ -22,11 +22,9 @@ from _report_paths import (
     BASELINE_APRIL_DAILY,
     BASELINE_VALIDATION_MONTHLY,
     FIGURES,
-    HURDLE_APRIL_CALIBRATION,
     HURDLE_APRIL_DAILY_NETWORK,
     HURDLE_APRIL_DAILY_PATTERN,
     HURDLE_APRIL_DAILY_STORE,
-    HURDLE_APRIL_STORE_CALIBRATION,
     STORE_REG_APRIL_DAILY,
     STORE_REG_VALIDATION_MONTHLY,
     ensure_report_dirs,
@@ -34,7 +32,6 @@ from _report_paths import (
 from _report_paths import PROCESSED, PROJECT_ROOT
 
 MARTS = PROCESSED / "marts"
-STORE_KEYS = ["warehouse", "customer_id", "store"]
 
 
 def save(fig: plt.Figure, name: str) -> Path:
@@ -46,40 +43,16 @@ def save(fig: plt.Figure, name: str) -> Path:
     return out
 
 
-def load_hurdle_april_dailies() -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    if HURDLE_APRIL_DAILY_PATTERN.exists() and HURDLE_APRIL_DAILY_STORE.exists():
-        return (
-            pd.read_csv(HURDLE_APRIL_DAILY_PATTERN, parse_dates=["date"]),
-            pd.read_csv(HURDLE_APRIL_DAILY_STORE, parse_dates=["date"]),
-        )
-    if not (
-        HURDLE_APRIL_DAILY_NETWORK.exists()
-        and HURDLE_APRIL_CALIBRATION.exists()
-        and HURDLE_APRIL_STORE_CALIBRATION.exists()
+def load_hurdle_april_daily() -> pd.DataFrame | None:
+    """Sliding-window April daily (pattern / store / network exports are equivalent)."""
+    for path in (
+        HURDLE_APRIL_DAILY_NETWORK,
+        HURDLE_APRIL_DAILY_PATTERN,
+        HURDLE_APRIL_DAILY_STORE,
     ):
-        return None
-    print("[info] Deriving hurdle pattern/store daily from network-scaled export.")
-    scaled = pd.read_csv(HURDLE_APRIL_DAILY_NETWORK, parse_dates=["date"])
-    cal = pd.read_csv(HURDLE_APRIL_CALIBRATION)
-    ns_row = cal.loc[cal["metric"] == "april_network_scale", "value"]
-    if ns_row.empty:
-        ns_row = cal.loc[cal["metric"] == "april_scale", "value"]
-    ns = float(ns_row.iloc[0])
-    store_scales = (
-        pd.read_csv(HURDLE_APRIL_STORE_CALIBRATION)
-        .set_index(STORE_KEYS)["store_scale"]
-        .astype(np.float64)
-    )
-    keys = scaled[STORE_KEYS].apply(tuple, axis=1)
-    mult = keys.map(store_scales).fillna(1.0).astype(np.float64).values
-    qty_scaled = scaled["qty_ea"].astype(np.float64).values
-    qty_store = qty_scaled / ns
-    qty_pattern = np.where(mult > 1e-12, qty_store / mult, qty_store)
-    fs = scaled.copy()
-    fs["qty_ea"] = qty_store
-    fp = scaled.copy()
-    fp["qty_ea"] = qty_pattern
-    return fp, fs
+        if path.exists():
+            return pd.read_csv(path, parse_dates=["date"])
+    return None
 
 
 def plot_model_suite(
@@ -170,33 +143,23 @@ def _plot_validation_error_hist(monthly: pd.DataFrame, title: str, fname: str) -
 
 def plot_multi_model_comparison(
     fc: pd.DataFrame,
-    fh_pattern: pd.DataFrame,
-    fh_store: pd.DataFrame,
+    fh: pd.DataFrame,
     fs_reg: pd.DataFrame,
     wh_day: pd.DataFrame,
 ) -> None:
     daily_b = fc.groupby("date")["qty_ea"].sum().sort_index()
-    daily_hp = fh_pattern.groupby("date")["qty_ea"].sum().sort_index()
-    daily_hs = fh_store.groupby("date")["qty_ea"].sum().sort_index()
+    daily_h = fh.groupby("date")["qty_ea"].sum().sort_index()
     daily_sr = fs_reg.groupby("date")["qty_ea"].sum().sort_index()
     daily_actual = wh_day.groupby("create_date")["qty_ea"].sum()
 
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan–Mar 28)", color="steelblue", linewidth=2)
-    ax.plot(daily_b.index, daily_b.values, label="baseline (Apr)", color="firebrick", linewidth=2)
-    ax.plot(daily_hp.index, daily_hp.values, label="hurdle pattern (Apr)", color="goldenrod", linewidth=1.8)
-    ax.plot(
-        daily_hs.index,
-        daily_hs.values,
-        label="hurdle store-cal (Apr)",
-        color="darkorange",
-        linewidth=1.8,
-        linestyle="--",
-    )
+    ax.plot(daily_b.index, daily_b.values, label="baseline sliding (Apr)", color="firebrick", linewidth=2)
+    ax.plot(daily_h.index, daily_h.values, label="hurdle sliding (Apr)", color="goldenrod", linewidth=2)
     ax.plot(
         daily_sr.index,
         daily_sr.values,
-        label="store regression (Apr)",
+        label="store regression sliding (Apr)",
         color="seagreen",
         linewidth=2,
     )
@@ -211,10 +174,9 @@ def plot_multi_model_comparison(
 
     fig, ax = plt.subplots(figsize=(11, 5))
     ax.plot(daily_actual.index, daily_actual.values, label="actual (Jan–Mar 28)", color="steelblue")
-    ax.plot(daily_b.index, daily_b.values, label="baseline (Apr)", color="firebrick")
-    ax.plot(daily_hp.index, daily_hp.values, label="hurdle pattern (Apr)", color="goldenrod")
-    ax.plot(daily_hs.index, daily_hs.values, label="hurdle store-cal (Apr)", color="darkorange", linestyle="--")
-    ax.plot(daily_sr.index, daily_sr.values, label="store regression (Apr)", color="seagreen")
+    ax.plot(daily_b.index, daily_b.values, label="baseline sliding (Apr)", color="firebrick")
+    ax.plot(daily_h.index, daily_h.values, label="hurdle sliding (Apr)", color="goldenrod")
+    ax.plot(daily_sr.index, daily_sr.values, label="store regression sliding (Apr)", color="seagreen")
     ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="gray", alpha=0.06)
     ax.set_title("Daily total qty_ea: history + April forecasts (all models)")
     ax.set_ylabel("qty_ea")
@@ -224,26 +186,23 @@ def plot_multi_model_comparison(
     save(fig, "18_history_all_models_forecast.png")
 
     wh_b = fc.groupby("warehouse")["qty_ea"].sum()
-    wh_p = fh_pattern.groupby("warehouse")["qty_ea"].sum()
-    wh_s = fh_store.groupby("warehouse")["qty_ea"].sum()
+    wh_h = fh.groupby("warehouse")["qty_ea"].sum()
     wh_r = fs_reg.groupby("warehouse")["qty_ea"].sum()
     wh_cmp = pd.DataFrame(
         {
             "baseline": wh_b,
-            "hurdle_pattern": wh_p,
-            "hurdle_store": wh_s,
+            "hurdle": wh_h,
             "store_regression": wh_r,
         }
     ).fillna(0)
     wh_cmp["max_pair"] = wh_cmp.max(axis=1)
     top_wh = wh_cmp.nlargest(15, "max_pair").sort_values("baseline")
     y = np.arange(len(top_wh))
-    h = 0.18
+    h = 0.22
     fig, ax = plt.subplots(figsize=(11, 7))
-    ax.barh(y - 1.5 * h, top_wh["baseline"], height=h, label="baseline", color="firebrick", alpha=0.85)
-    ax.barh(y - 0.5 * h, top_wh["hurdle_pattern"], height=h, label="hurdle pattern", color="goldenrod", alpha=0.85)
-    ax.barh(y + 0.5 * h, top_wh["hurdle_store"], height=h, label="hurdle store-cal", color="darkorange", alpha=0.85)
-    ax.barh(y + 1.5 * h, top_wh["store_regression"], height=h, label="store regression", color="seagreen", alpha=0.85)
+    ax.barh(y - h, top_wh["baseline"], height=h, label="baseline sliding", color="firebrick", alpha=0.85)
+    ax.barh(y, top_wh["hurdle"], height=h, label="hurdle sliding", color="goldenrod", alpha=0.85)
+    ax.barh(y + h, top_wh["store_regression"], height=h, label="store reg sliding", color="seagreen", alpha=0.85)
     ax.set_yticks(y)
     ax.set_yticklabels(top_wh.index)
     ax.set_xlabel("predicted qty_ea (April)")
@@ -253,15 +212,13 @@ def plot_multi_model_comparison(
     save(fig, "17_april_warehouse_all_models.png")
 
     cust_b = fc.groupby("customer_id")["qty_ea"].sum()
-    cust_p = fh_pattern.groupby("customer_id")["qty_ea"].sum()
-    cust_s = fh_store.groupby("customer_id")["qty_ea"].sum()
+    cust_h = fh.groupby("customer_id")["qty_ea"].sum()
     cust_r = fs_reg.groupby("customer_id")["qty_ea"].sum()
     cust_cmp = (
         pd.DataFrame(
             {
                 "baseline": cust_b,
-                "hurdle_pattern": cust_p,
-                "hurdle_store": cust_s,
+                "hurdle": cust_h,
                 "store_regression": cust_r,
             }
         )
@@ -269,12 +226,11 @@ def plot_multi_model_comparison(
         .sort_index()
     )
     x = np.arange(len(cust_cmp))
-    w = 0.18
+    w = 0.22
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(x - 1.5 * w, cust_cmp["baseline"], width=w, label="baseline", color="firebrick", alpha=0.85)
-    ax.bar(x - 0.5 * w, cust_cmp["hurdle_pattern"], width=w, label="hurdle pattern", color="goldenrod", alpha=0.85)
-    ax.bar(x + 0.5 * w, cust_cmp["hurdle_store"], width=w, label="hurdle store-cal", color="darkorange", alpha=0.85)
-    ax.bar(x + 1.5 * w, cust_cmp["store_regression"], width=w, label="store regression", color="seagreen", alpha=0.85)
+    ax.bar(x - w, cust_cmp["baseline"], width=w, label="baseline sliding", color="firebrick", alpha=0.85)
+    ax.bar(x, cust_cmp["hurdle"], width=w, label="hurdle sliding", color="goldenrod", alpha=0.85)
+    ax.bar(x + w, cust_cmp["store_regression"], width=w, label="store reg sliding", color="seagreen", alpha=0.85)
     ax.set_xticks(x)
     ax.set_xticklabels(cust_cmp.index)
     ax.set_ylabel("predicted qty_ea (April)")
@@ -283,11 +239,9 @@ def plot_multi_model_comparison(
     ax.grid(True, axis="y", alpha=0.3)
     save(fig, "19_april_customer_all_models.png")
 
-    # Keep legacy filenames for baseline vs hurdle (without store reg) for backward compatibility
     fig, ax = plt.subplots(figsize=(11, 5))
-    ax.plot(daily_b.index, daily_b.values, label="baseline", color="firebrick", linewidth=2)
-    ax.plot(daily_hp.index, daily_hp.values, label="hurdle pattern", color="goldenrod", linewidth=2)
-    ax.plot(daily_hs.index, daily_hs.values, label="hurdle store-cal", color="darkorange", linestyle="--", linewidth=2)
+    ax.plot(daily_b.index, daily_b.values, label="baseline sliding", color="firebrick", linewidth=2)
+    ax.plot(daily_h.index, daily_h.values, label="hurdle sliding", color="goldenrod", linewidth=2)
     ax.axvspan(pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), color="gray", alpha=0.06)
     ax.set_title("April forecast: daily total — baseline vs hurdle")
     ax.set_ylabel("qty_ea")
@@ -325,37 +279,36 @@ def main() -> int:
         monthly_sr = pd.read_csv(STORE_REG_VALIDATION_MONTHLY)
         fc_sr = pd.read_csv(STORE_REG_APRIL_DAILY, parse_dates=["date"])
         _plot_history_plus_forecast(
-            wh_day, fc_sr, "Store regression: history + April",
+            wh_day, fc_sr, "Store regression (sliding): history + April",
             "29_store_regression_history_plus_forecast.png", "seagreen",
         )
         _plot_monthly_scatter(
-            monthly_sr, "Store regression: March validation scatter",
+            monthly_sr, "Store regression (sliding): March validation scatter",
             "27_store_regression_validation_monthly_scatter.png",
         )
         _plot_april_daily_bars(
-            fc_sr, "Store regression: April daily total",
+            fc_sr, "Store regression (sliding): April daily total",
             "28_store_regression_april_forecast_daily.png", "seagreen",
         )
         _plot_april_warehouse_share(
-            fc_sr, "Store regression: top warehouses (April)",
+            fc_sr, "Store regression (sliding): top warehouses (April)",
             "30_store_regression_april_warehouse_share.png",
         )
         _plot_validation_error_hist(
-            monthly_sr, "Store regression: March validation errors",
+            monthly_sr, "Store regression (sliding): March validation errors",
             "31_store_regression_validation_error_hist.png",
         )
     else:
         print("[skip] Store regression CSVs missing; run 04c_store_regression_model.py")
 
-    hurdle = load_hurdle_april_dailies()
-    if hurdle is None:
+    fh = load_hurdle_april_daily()
+    if fh is None:
         print("[skip] Hurdle daily exports missing; skipping multi-model charts.")
         return 0
 
-    fh_pattern, fh_store = hurdle
     if STORE_REG_APRIL_DAILY.exists():
         fs_reg = pd.read_csv(STORE_REG_APRIL_DAILY, parse_dates=["date"])
-        plot_multi_model_comparison(fc_b, fh_pattern, fh_store, fs_reg, wh_day)
+        plot_multi_model_comparison(fc_b, fh, fs_reg, wh_day)
     else:
         print("[skip] Multi-model comparison needs store regression April daily.")
 

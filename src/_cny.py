@@ -60,6 +60,14 @@ def detect_warehouse_closure(df: pd.DataFrame) -> pd.DataFrame:
     return daily[["warehouse", "date", "is_warehouse_closed"]]
 
 
+_CNY_FEATURE_COLS = (
+    "is_cny_window",
+    "is_warehouse_closed",
+    "days_to_cny",
+    "days_from_cny",
+)
+
+
 def add_cny_features(df: pd.DataFrame, closure: pd.DataFrame) -> pd.DataFrame:
     """Merge closure and add calendar CNY features.
 
@@ -68,6 +76,9 @@ def add_cny_features(df: pd.DataFrame, closure: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
     out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    drop = [c for c in _CNY_FEATURE_COLS if c in out.columns]
+    if drop:
+        out = out.drop(columns=drop)
     c = closure.copy()
     c["date"] = pd.to_datetime(c["date"], errors="coerce").dt.normalize()
     out = out.merge(c, on=["warehouse", "date"], how="left")

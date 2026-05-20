@@ -1,12 +1,11 @@
-"""Step 4b: Store-grain hurdle model with pattern-based April forecast.
+"""Step 4b: Store-grain hurdle model with sliding-window train/validate/forecast.
 
 Grain: (warehouse, store, product_id) x day.
 
-- Jan–Mar: GBDT hurdle (classifier x Poisson) for validation metrics.
-- April: **pattern continuation** from the last ``PATTERN_LOOKBACK_DAYS`` of history,
-  blended with Jan–Mar tuple-level statistics for order probability and robust order size,
-  then **per-store calibration** toward each store's Jan/Mar mean daily total and a **network**
-  scale toward ``Q_target``.
+- **Lookback:** 14 warehouse-open days (CNY closure skipped).
+- **Horizon:** next 7 calendar days; slide forward 7 days.
+- **Model:** classifier P(order) x Poisson size; trained on sliding samples.
+- **April:** same weekly sliding forecast (predictions extend the lookback).
 """
 
 from __future__ import annotations
@@ -30,6 +29,13 @@ from _cny import (
     make_sample_weights,
     mask_qty_for_features,
 )
+from _gbdt_gpu import (
+    fit_classifier,
+    fit_regressor,
+    predict as gbdt_predict,
+    predict_proba_positive,
+    want_gpu,
+)
 from _metrics import (
     bias_ratio,
     evaluate_arrays,
@@ -38,6 +44,17 @@ from _metrics import (
     intermittent_hurdle_loss_report,
     smape_fracs,
     wmape,
+)
+from _sliding_window import (
+    HORIZON_DAYS,
+    LOOKBACK_OPEN_DAYS,
+    SLIDE_STEP_DAYS,
+    SLIDE_STEP_TRAIN_DAYS,
+    anchors_with_horizon_in,
+    build_sliding_samples,
+    sample_weights_sliding,
+    sliding_feature_columns,
+    sliding_forecast_period,
 )
 
 from _report_paths import (
@@ -120,7 +137,11 @@ def write_hurdle_daily_csv(
     path: Path,
     name_lookup: pd.DataFrame,
 ) -> None:
-    extra = [c for c in ("product_name", "temperature_zone") if c in daily_fc.columns]
+    extra = [
+        c
+        for c in ("customer_id", "product_name", "temperature_zone")
+        if c in daily_fc.columns
+    ]
     base = daily_fc.drop(columns=extra, errors="ignore")
     out = base.merge(name_lookup, on=ID_COLS, how="left")
     out.to_csv(path, index=False, encoding="utf-8-sig")
@@ -676,11 +697,32 @@ def feature_columns() -> list[str]:
 
 
 def fit_hurdle(
-    X: pd.DataFrame,
-    y_qty: pd.Series,
+    X: pd.DataFrame | np.ndarray,
+    y_qty: pd.Series | np.ndarray,
     sample_weight: np.ndarray,
-) -> tuple[HistGradientBoostingClassifier, HistGradientBoostingRegressor]:
-    y_bin = (y_qty > 0).astype(np.int8)
+    *,
+    use_gpu: bool = False,
+) -> tuple[object, object, str, str]:
+    if isinstance(X, pd.DataFrame):
+        X_arr = X.to_numpy(dtype=np.float64)
+    else:
+        X_arr = np.asarray(X, dtype=np.float64)
+    y_arr = y_qty.to_numpy(dtype=np.float64) if isinstance(y_qty, pd.Series) else np.asarray(y_qty, dtype=np.float64)
+    y_bin = (y_arr > 0).astype(np.int8)
+
+    if use_gpu:
+        clf, clf_b = fit_classifier(X_arr, y_bin, sample_weight, use_gpu=True, num_boost_round=200)
+        pos = y_bin == 1
+        reg, reg_b = fit_regressor(
+            X_arr[pos],
+            y_arr[pos],
+            sample_weight[pos] if sample_weight is not None else None,
+            use_gpu=True,
+            num_boost_round=350,
+            params={"learning_rate": 0.08},
+        )
+        return clf, reg, clf_b, reg_b
+
     clf = HistGradientBoostingClassifier(
         loss="log_loss",
         learning_rate=0.08,
@@ -690,8 +732,7 @@ def fit_hurdle(
         class_weight="balanced",
         random_state=42,
     )
-    clf.fit(X, y_bin, sample_weight=sample_weight)
-
+    clf.fit(X_arr, y_bin, sample_weight=sample_weight)
     pos = y_bin == 1
     reg = HistGradientBoostingRegressor(
         loss="poisson",
@@ -703,21 +744,27 @@ def fit_hurdle(
         early_stopping=False,
         random_state=42,
     )
-    reg.fit(X.loc[pos], y_qty.loc[pos], sample_weight=sample_weight[pos])
-    return clf, reg
+    reg.fit(X_arr[pos], y_arr[pos], sample_weight=sample_weight[pos])
+    return clf, reg, "sklearn_cpu", "sklearn_cpu"
 
 
 def predict_hurdle(
-    clf: HistGradientBoostingClassifier,
-    reg: HistGradientBoostingRegressor,
-    X: pd.DataFrame,
+    clf: object,
+    reg: object,
+    X: pd.DataFrame | np.ndarray,
     pos_rate_train: np.ndarray | None = None,
     *,
+    clf_backend: str = "sklearn_cpu",
+    reg_backend: str = "sklearn_cpu",
     blend_lambda: float | None = None,
     prior_k: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    p_raw = clf.predict_proba(X)[:, 1]
-    mu = np.clip(reg.predict(X), 0, None)
+    X_arr = X.to_numpy(dtype=np.float64) if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=np.float64)
+    if clf_backend == "xgboost_cuda":
+        p_raw = predict_proba_positive(clf, clf_backend, X_arr)
+    else:
+        p_raw = clf.predict_proba(X_arr)[:, 1]
+    mu = np.clip(gbdt_predict(reg, reg_backend, X_arr), 0, None)
     lam = P_ORDER_BLEND_LAMBDA if blend_lambda is None else float(blend_lambda)
     k = P_ORDER_PRIOR_K if prior_k is None else float(prior_k)
     if pos_rate_train is None or lam <= 0:
@@ -732,10 +779,13 @@ def predict_hurdle(
 
 
 def tune_prior_hyperparams(
-    clf: HistGradientBoostingClassifier,
-    reg: HistGradientBoostingRegressor,
+    clf: object,
+    reg: object,
     valid_open: pd.DataFrame,
     feat_cols: list[str],
+    *,
+    clf_backend: str = "sklearn_cpu",
+    reg_backend: str = "sklearn_cpu",
 ) -> tuple[float, float]:
     """Pick (blend_lambda, prior_k) from March validation.
 
@@ -762,7 +812,10 @@ def tune_prior_hyperparams(
 
     for lam in lambdas:
         for k in ks:
-            pred, p_ord, _ = predict_hurdle(clf, reg, X, pr, blend_lambda=lam, prior_k=k)
+            pred, p_ord, _ = predict_hurdle(
+                clf, reg, X, pr, blend_lambda=lam, prior_k=k,
+                clf_backend=clf_backend, reg_backend=reg_backend,
+            )
             pred_df = valid_open[keys].copy()
             pred_df["pred"] = pred
             pred_m = pred_df.groupby(keys, as_index=False)["pred"].sum()
@@ -1013,6 +1066,8 @@ def main() -> int:
     global P_ORDER_BLEND_LAMBDA, P_ORDER_PRIOR_K
 
     ensure_report_dirs()
+    use_gpu = want_gpu("HURDLE")
+    log(f"Training backend: {'XGBoost CUDA' if use_gpu else 'sklearn HistGradientBoosting (CPU)'}")
     log("Loading store-level mart...")
     raw = load_panel_base()
 
@@ -1033,26 +1088,39 @@ def main() -> int:
         f"Q_Mar={q_stats['Q_Mar']:,.1f}  Q_target={q_stats['Q_target']:,.1f}"
     )
 
-    log("Encoding + feature engineering (train panel)...")
-    panel_cny = add_cny_features(panel.copy(), closure)
-    panel_cny["qty_ea_masked"] = mask_qty_for_features(panel_cny)
-    panel_cny["order_signal"] = (panel_cny["qty_ea"] > 0).astype(np.float64)
-    encoders = build_encoders(panel_cny)
-    panel_feat = engineer_features(panel, encoders, closure)
+    log("Sliding-window samples + encodings...")
+    panel = add_cny_features(panel, closure)
+    encoders = build_encoders(panel)
+    static_enc = apply_encoders(
+        panel[ID_COLS + ["customer_id", "temperature_zone"]].drop_duplicates(ID_COLS),
+        encoders,
+    )
+    feat_cols = sliding_feature_columns(CATEGORICAL_ENC)
+    tuple_priors = tuple_recursive_priors(panel)
 
-    feat_cols = feature_columns()
-    train_mask = panel_feat["date"] <= TRAIN_END
-    valid_mask = (panel_feat["date"] >= VALID_START) & (panel_feat["date"] <= VALID_END)
+    train_anchors = anchors_with_horizon_in(
+        JAN_START, TRAIN_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    valid_anchors = anchors_with_horizon_in(
+        VALID_START, VALID_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    log(
+        f"  lookback={LOOKBACK_OPEN_DAYS} open days, horizon={HORIZON_DAYS}d, "
+        f"train_step={SLIDE_STEP_TRAIN_DAYS}d, april_step={SLIDE_STEP_DAYS}d  "
+        f"train_anchors={len(train_anchors)}  valid_anchors={len(valid_anchors)}"
+    )
 
-    train_df = panel_feat.loc[train_mask].copy()
-    valid_df = panel_feat.loc[valid_mask].copy()
-    log(f"  train rows: {len(train_df):,}  valid rows: {len(valid_df):,}")
+    train_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, train_anchors, closure
+    )
+    valid_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, valid_anchors, closure
+    )
+    log(f"  train sample rows: {len(train_df):,}  valid sample rows: {len(valid_df):,}")
 
-    w_train = make_sample_weights(train_df)
+    w_train = sample_weights_sliding(train_df)
     X_train = train_df[feat_cols].fillna(0.0)
     y_train = train_df["qty_ea"].astype(float)
-
-    tuple_priors = tuple_recursive_priors(panel)
 
     valid_open = valid_df[valid_df["is_warehouse_closed"] != 1].copy()
     valid_open = valid_open.merge(tuple_priors, on=ID_COLS, how="left")
@@ -1061,16 +1129,23 @@ def main() -> int:
     X_valid = valid_open[feat_cols].fillna(0.0)
     y_valid = valid_open["qty_ea"].astype(float)
 
-    log("Training hurdle (Jan+Feb -> Mar validation)...")
-    clf_val, reg_val = fit_hurdle(X_train, y_train, w_train)
+    log("Training hurdle on sliding Jan-Feb horizons...")
+    clf_val, reg_val, clf_b, reg_b = fit_hurdle(X_train, y_train, w_train, use_gpu=use_gpu)
 
-    log("Tuning P(order) prior blend on March validation...")
-    P_ORDER_BLEND_LAMBDA, P_ORDER_PRIOR_K = tune_prior_hyperparams(
-        clf_val, reg_val, valid_open, feat_cols
+    log("Tuning P(order) prior blend on March sliding validation...")
+    blend_lam, prior_k = tune_prior_hyperparams(
+        clf_val, reg_val, valid_open, feat_cols, clf_backend=clf_b, reg_backend=reg_b
     )
 
     pred_val, p_val, mu_val = predict_hurdle(
-        clf_val, reg_val, X_valid, valid_open["pos_rate_train"].values
+        clf_val,
+        reg_val,
+        X_valid,
+        valid_open["pos_rate_train"].values,
+        blend_lambda=blend_lam,
+        prior_k=prior_k,
+        clf_backend=clf_b,
+        reg_backend=reg_b,
     )
 
     log("Validation (regression, daily):")
@@ -1095,7 +1170,10 @@ def main() -> int:
 
     y_bin = (y_valid.values > 0).astype(int)
     log("Validation (classifier, raw proba for diagnostics):")
-    p_raw_val = clf_val.predict_proba(X_valid)[:, 1]
+    if clf_b == "xgboost_cuda":
+        p_raw_val = predict_proba_positive(clf_val, clf_b, X_valid.to_numpy(dtype=np.float64))
+    else:
+        p_raw_val = clf_val.predict_proba(X_valid)[:, 1]
     clf_metrics = evaluate_classifier(y_bin, p_raw_val)
 
     diag = valid_open[ID_COLS + ["customer_id", "date", "qty_ea"]].copy()
@@ -1202,69 +1280,70 @@ def main() -> int:
         {"metric": "Q_target", "value": q_stats["Q_target"]},
         {"metric": "P_order_blend_lambda", "value": P_ORDER_BLEND_LAMBDA},
         {"metric": "P_order_prior_k", "value": P_ORDER_PRIOR_K},
+        {"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)},
+        {"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)},
+        {"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)},
+        {"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)},
+        {"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)},
     ]
     pd.DataFrame(cal_rows).to_csv(
         HURDLE_VALIDATION_OVERALL, index=False, encoding="utf-8-sig"
     )
 
-    log("Retraining on Jan-Mar...")
-    full_df = panel_feat.copy()
-    w_full = make_sample_weights(full_df)
-    X_full = full_df[feat_cols].fillna(0.0)
-    y_full = full_df["qty_ea"].astype(float)
-    clf_full, reg_full = fit_hurdle(X_full, y_full, w_full)
-
-    log(
-        f"Pattern April forecast (lookback={PATTERN_LOOKBACK_DAYS}d, "
-        "gap + DOW cadence, no recursive yesterday)..."
+    log("Retraining hurdle on sliding samples through March...")
+    full_anchors = anchors_with_horizon_in(
+        JAN_START, HISTORY_END, step_days=SLIDE_STEP_TRAIN_DAYS
     )
-    patterns = compute_tuple_order_patterns(panel, HISTORY_END, PATTERN_LOOKBACK_DAYS)
-    log(
-        f"  patterns: {len(patterns):,} tuples  "
-        f"mean pos_rate={patterns['pos_rate'].mean():.3f}  "
-        f"mean gap={patterns['mean_gap_days'].mean():.1f}d"
+    full_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, full_anchors, closure
     )
-    forecast_dates = pd.date_range(FORECAST_START, FORECAST_END, freq="D")
-    daily_fc_pattern = pattern_forecast_april(patterns, forecast_dates, closure)
-
-    q_apr_raw = mean_network_daily_total(daily_fc_pattern)
-    log(f"  April raw mean daily network total Q_apr_raw={q_apr_raw:,.1f}")
-
-    store_targets = compute_store_daily_targets(panel)
-    daily_fc_store, store_cal_diag = calibrate_april_per_store(
-        daily_fc_pattern.copy(), store_targets
-    )
-    q_apr_store = mean_network_daily_total(daily_fc_store)
-    n_store_clip = int(store_cal_diag["store_scale_clipped"].sum())
-    log(
-        f"  Per-store calibration: n={len(store_cal_diag):,}  "
-        f"mean_store_scale={store_cal_diag['store_scale'].mean():.3f}  "
-        f"median={store_cal_diag['store_scale'].median():.3f}  clipped={n_store_clip}  "
-        f"Q_after_store={q_apr_store:,.1f}"
-    )
-    store_cal_diag.to_csv(
-        HURDLE_APRIL_STORE_CALIBRATION, index=False, encoding="utf-8-sig"
+    w_full = sample_weights_sliding(full_df)
+    clf_full, reg_full, clf_bf, reg_bf = fit_hurdle(
+        full_df[feat_cols].fillna(0.0),
+        full_df["qty_ea"].astype(float),
+        w_full,
+        use_gpu=use_gpu,
     )
 
-    apr1_soften_scale = 1.0
+    def predict_hurdle_batch(batch: pd.DataFrame) -> np.ndarray:
+        b = batch.merge(tuple_priors, on=ID_COLS, how="left")
+        b["pos_rate_train"] = b["pos_rate_train"].fillna(0.03)
+        pred, _, _ = predict_hurdle(
+            clf_full,
+            reg_full,
+            b[feat_cols].fillna(0.0),
+            b["pos_rate_train"].values,
+            blend_lambda=P_ORDER_BLEND_LAMBDA,
+            prior_k=P_ORDER_PRIOR_K,
+            clf_backend=clf_bf,
+            reg_backend=reg_bf,
+        )
+        return pred
 
-    daily_fc, apr_scale, q_before_network_scale = calibrate_april_forecast(
-        daily_fc_store.copy(), q_stats["Q_target"]
+    log("Sliding April forecast (weekly blocks; predictions extend lookback)...")
+    april_anchors = anchors_with_horizon_in(FORECAST_START, FORECAST_END)
+    daily_fc = sliding_forecast_period(
+        panel,
+        ID_COLS,
+        CATEGORICAL_ENC,
+        static_enc,
+        april_anchors,
+        predict_hurdle_batch,
+        closure,
     )
-    q_apr_cal = mean_network_daily_total(daily_fc)
-    log(
-        f"  April network scale={apr_scale:.4f}  Q_apr_cal={q_apr_cal:,.1f}  "
-        f"(target Q_target={q_stats['Q_target']:,.1f}; pre-network Q={q_before_network_scale:,.1f})"
-    )
+    q_apr = mean_network_daily_total(daily_fc)
+    log(f"  April mean daily network total Q_apr={q_apr:,.1f}  (Q_target={q_stats['Q_target']:,.1f})")
 
-    name_lookup = panel[ID_COLS + ["product_name", "temperature_zone"]].drop_duplicates(ID_COLS)
+    name_lookup = panel[
+        ID_COLS + ["customer_id", "product_name", "temperature_zone"]
+    ].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
-    write_hurdle_daily_csv(daily_fc_pattern, HURDLE_APRIL_DAILY_PATTERN, name_lookup)
-    write_hurdle_daily_csv(daily_fc_store, HURDLE_APRIL_DAILY_STORE, name_lookup)
+    write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_PATTERN, name_lookup)
+    write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_STORE, name_lookup)
     write_hurdle_daily_csv(daily_fc, HURDLE_APRIL_DAILY_NETWORK, name_lookup)
     log(
-        f"  Wrote April daily: {HURDLE_DAILY_PATTERN_CSV}, {HURDLE_DAILY_STORE_CSV}, "
-        f"{HURDLE_DAILY_NETWORK_CSV} (network-scaled)"
+        f"  Wrote April daily (sliding, all tiers identical): {HURDLE_DAILY_PATTERN_CSV}, "
+        f"{HURDLE_DAILY_STORE_CSV}, {HURDLE_DAILY_NETWORK_CSV}"
     )
 
     pd.DataFrame(
@@ -1272,25 +1351,18 @@ def main() -> int:
             {"metric": "Q_Jan", "value": q_stats["Q_Jan"]},
             {"metric": "Q_Mar", "value": q_stats["Q_Mar"]},
             {"metric": "Q_target", "value": q_stats["Q_target"]},
-            {"metric": "Q_apr_raw", "value": q_apr_raw},
-            {"metric": "Q_apr_after_store_cal", "value": q_apr_store},
-            {"metric": "Q_apr_calibrated", "value": q_apr_cal},
-            {"metric": "april_network_scale", "value": apr_scale},
-            {"metric": "mean_store_scale", "value": float(store_cal_diag["store_scale"].mean())},
-            {"metric": "median_store_scale", "value": float(store_cal_diag["store_scale"].median())},
-            {
-                "metric": "pct_store_scale_clipped",
-                "value": float(store_cal_diag["store_scale_clipped"].mean()),
-            },
-            {"metric": "april1_soften_scale", "value": apr1_soften_scale},
-            {"metric": "pattern_lookback_days", "value": PATTERN_LOOKBACK_DAYS},
-            {"metric": "pattern_long_history_blend", "value": PATTERN_LONG_HISTORY_BLEND},
-            {"metric": "pattern_qty_median_weight", "value": PATTERN_QTY_MEDIAN_WEIGHT},
-            {"metric": "pattern_qty_long_shrink", "value": PATTERN_QTY_LONG_SHRINK},
+            {"metric": "Q_apr_sliding", "value": q_apr},
+            {"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)},
+            {"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)},
+            {"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)},
+            {"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)},
             {"metric": "P_order_blend_lambda", "value": P_ORDER_BLEND_LAMBDA},
             {"metric": "P_order_prior_k", "value": P_ORDER_PRIOR_K},
         ]
     ).to_csv(HURDLE_APRIL_CALIBRATION, index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        columns=["warehouse", "customer_id", "store", "store_scale", "store_scale_clipped"]
+    ).to_csv(HURDLE_APRIL_STORE_CALIBRATION, index=False, encoding="utf-8-sig")
 
     monthly_wcp = (
         daily_fc.groupby(["warehouse", "customer_id", "product_id", "product_name", "temperature_zone"])[
@@ -1332,7 +1404,7 @@ def main() -> int:
     log("Done.")
     log(
         f"April daily rows: {len(daily_fc):,}  total pred qty_ea: {daily_fc['qty_ea'].sum():,.1f}  "
-        f"mean daily network total: {q_apr_cal:,.1f}"
+        f"mean daily network total: {q_apr:,.1f}"
     )
     return 0
 

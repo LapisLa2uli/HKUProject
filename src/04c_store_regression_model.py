@@ -1,18 +1,8 @@
 """Step 4c: Store-level demand model (third model).
 
-Modeling grain: (warehouse, store, product_id) x day.
-Target: daily ``qty_ea`` (same as hurdle).
-
-March validation: Poisson GBDT on the dense panel (lags + calendar + CNY).
-April forecast (default): **gap + DOW pattern continuation** (``_pattern_forecast``),
-which schedules sparse order days and puts robust order size on those days only.
-This avoids Poisson "smearing" (tiny positive qty on every day) for intermittent stores.
-
-Set ``STORE_REG_APRIL_MODE=recursive`` to use the legacy recursive Poisson April path.
-
-Optimizations:
-    - Vectorized lag/rolling on the dense panel (2D reshape).
-    - Optional XGBoost GPU training when CUDA is available (falls back to sklearn CPU).
+Grain: (warehouse, store, product_id) x day. Uses the same **sliding-window**
+protocol as baseline (14 open days -> next 7 days; CNY closure days skipped).
+Optional XGBoost GPU when CUDA is available.
 """
 
 from __future__ import annotations
@@ -31,14 +21,20 @@ _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from _cny import (
-    add_cny_features,
-    detect_warehouse_closure,
-    make_sample_weights,
-    mask_qty_for_features,
-)
+from _cny import add_cny_features, detect_warehouse_closure
+from _gbdt_gpu import fit_regressor, predict as gbdt_predict, want_gpu
 from _metrics import bias_ratio, evaluate_arrays, wmape
-from _pattern_forecast import compute_tuple_order_patterns, pattern_forecast_april
+from _sliding_window import (
+    HORIZON_DAYS,
+    LOOKBACK_OPEN_DAYS,
+    SLIDE_STEP_DAYS,
+    SLIDE_STEP_TRAIN_DAYS,
+    anchors_with_horizon_in,
+    build_sliding_samples,
+    sample_weights_sliding,
+    sliding_feature_columns,
+    sliding_forecast_period,
+)
 from _report_paths import (
     STORE_REG_APRIL_DAILY,
     STORE_REG_APRIL_MONTHLY_STORE,
@@ -81,38 +77,6 @@ class RegressorModel(Protocol):
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def _april_mode() -> str:
-    mode = os.environ.get("STORE_REG_APRIL_MODE", "pattern").strip().lower()
-    if mode not in ("pattern", "recursive"):
-        log(f"Unknown STORE_REG_APRIL_MODE={mode!r}; using pattern")
-        return "pattern"
-    return mode
-
-
-def _want_gpu() -> bool:
-    if os.environ.get("STORE_REG_CPU", "").strip().lower() in ("1", "true", "yes"):
-        return False
-    return os.environ.get("STORE_REG_USE_GPU", "auto").strip().lower() != "0"
-
-
-def _cuda_xgboost_available() -> bool:
-    try:
-        import xgboost as xgb
-
-        X = np.random.rand(32, 4).astype(np.float32)
-        y = np.abs(np.random.randn(32)).astype(np.float32)
-        dm = xgb.DMatrix(X, label=y)
-        xgb.train(
-            {"tree_method": "hist", "device": "cuda", "objective": "count:poisson"},
-            dm,
-            num_boost_round=1,
-            verbose_eval=False,
-        )
-        return True
-    except Exception:
-        return False
 
 
 def load_panel_base() -> pd.DataFrame:
@@ -324,49 +288,6 @@ def feature_columns() -> list[str]:
     return cols
 
 
-def fit_model_sklearn(
-    X: np.ndarray,
-    y: np.ndarray,
-    sample_weight: np.ndarray | None = None,
-) -> HistGradientBoostingRegressor:
-    model = HistGradientBoostingRegressor(
-        loss="poisson",
-        learning_rate=0.06,
-        max_iter=600,
-        max_leaf_nodes=63,
-        min_samples_leaf=40,
-        l2_regularization=0.0,
-        early_stopping=False,
-        random_state=42,
-    )
-    model.fit(X, y, sample_weight=sample_weight)
-    return model
-
-
-def fit_model_xgb(
-    X: np.ndarray,
-    y: np.ndarray,
-    sample_weight: np.ndarray | None = None,
-) -> Any:
-    import xgboost as xgb
-
-    dtrain = xgb.DMatrix(X, label=y, weight=sample_weight)
-    params = {
-        "objective": "count:poisson",
-        "tree_method": "hist",
-        "device": "cuda",
-        "learning_rate": 0.06,
-        "max_depth": 8,
-        "max_leaves": 63,
-        "subsample": 1.0,
-        "lambda": 0.0,
-        "seed": 42,
-        "verbosity": 0,
-    }
-    booster = xgb.train(params, dtrain, num_boost_round=600)
-    return booster
-
-
 def fit_model(
     X: np.ndarray,
     y: np.ndarray,
@@ -374,17 +295,11 @@ def fit_model(
     *,
     use_gpu: bool,
 ) -> tuple[Any, str]:
-    if use_gpu:
-        return fit_model_xgb(X, y, sample_weight), "xgboost_cuda"
-    return fit_model_sklearn(X, y, sample_weight), "sklearn_cpu"
+    return fit_regressor(X, y, sample_weight, use_gpu=use_gpu, num_boost_round=600)
 
 
 def predict_model(model: Any, backend: str, X: np.ndarray) -> np.ndarray:
-    if backend == "xgboost_cuda":
-        import xgboost as xgb
-
-        return np.clip(model.predict(xgb.DMatrix(X)), 0, None)
-    return np.clip(model.predict(X), 0, None)
+    return np.clip(gbdt_predict(model, backend, X), 0, None)
 
 
 def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -551,7 +466,7 @@ def recursive_forecast(
 def main() -> int:
     ensure_report_dirs()
     t_start = time.perf_counter()
-    use_gpu = _want_gpu() and _cuda_xgboost_available()
+    use_gpu = want_gpu("STORE_REG")
     if use_gpu:
         log("Training backend: XGBoost CUDA")
     else:
@@ -564,34 +479,38 @@ def main() -> int:
     panel = build_dense_panel(raw, HISTORY_END)
     log(f"  panel rows: {len(panel):,}  unique tuples: {panel.groupby(ID_COLS).ngroups:,}")
 
-    log("CNY closure + masked qty for features...")
+    log("CNY closure detection...")
     closure = detect_warehouse_closure(raw)
     panel = add_cny_features(panel, closure)
-    panel["qty_ea_masked"] = mask_qty_for_features(panel)
 
-    log("Adding calendar + lag features...")
-    t_feat = time.perf_counter()
-    panel = add_calendar(panel)
-    if is_dense_regular_panel(panel):
-        panel_feat = add_lag_features_dense(panel)
-        log(f"  used vectorized dense lag/roll ({time.perf_counter() - t_feat:.1f}s)")
-    else:
-        panel_feat = add_lag_features_slow(panel)
-        panel_feat = add_calendar(panel_feat)
-        log(f"  used pandas lag/roll ({time.perf_counter() - t_feat:.1f}s)")
+    encoders = build_encoders(panel)
+    static_enc = apply_encoders(
+        panel[ID_COLS + ["customer_id", "temperature_zone"]].drop_duplicates(ID_COLS),
+        encoders,
+    )
+    feat_cols = sliding_feature_columns(CATEGORICAL_ENC)
 
-    encoders = build_encoders(panel_feat)
-    panel_feat = apply_encoders(panel_feat, encoders)
+    train_anchors = anchors_with_horizon_in(
+        JAN_START, TRAIN_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    valid_anchors = anchors_with_horizon_in(
+        VALID_START, VALID_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    log(
+        f"Sliding windows: lookback={LOOKBACK_OPEN_DAYS} open days, "
+        f"horizon={HORIZON_DAYS}d, train_step={SLIDE_STEP_TRAIN_DAYS}d, "
+        f"april_step={SLIDE_STEP_DAYS}d"
+    )
 
-    feat_cols = feature_columns()
-    train_mask = panel_feat["date"] <= TRAIN_END
-    valid_mask = (panel_feat["date"] >= VALID_START) & (panel_feat["date"] <= VALID_END)
+    train_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, train_anchors, closure
+    )
+    valid_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, valid_anchors, closure
+    )
+    log(f"  train sample rows: {len(train_df):,}  valid sample rows: {len(valid_df):,}")
 
-    train_df = panel_feat.loc[train_mask]
-    valid_df = panel_feat.loc[valid_mask]
-    log(f"  train rows: {len(train_df):,}  valid rows: {len(valid_df):,}")
-
-    w_train = make_sample_weights(train_df)
+    w_train = sample_weights_sliding(train_df)
     X_train = np.nan_to_num(train_df[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
     y_train = train_df["qty_ea"].to_numpy(dtype=np.float64)
 
@@ -599,7 +518,7 @@ def main() -> int:
     X_valid = np.nan_to_num(valid_open[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
     y_valid = valid_open["qty_ea"].to_numpy(dtype=np.float64)
 
-    log("Training validation model (Jan+Feb -> Mar)...")
+    log("Training validation model (sliding Jan-Feb -> Mar)...")
     t_train = time.perf_counter()
     model_val, backend = fit_model(X_train, y_train, w_train, use_gpu=use_gpu)
     log(f"  train time: {time.perf_counter() - t_train:.1f}s")
@@ -642,46 +561,48 @@ def main() -> int:
         + [{"metric": f"monthly_{k}", "value": v} for k, v in monthly_overall.items()]
         + [{"metric": "monthly_wmape", "value": wmape_m}, {"metric": "monthly_bias_ratio", "value": bias_m}]
         + [{"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)}]
+        + [{"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)}]
+        + [{"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)}]
+        + [{"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)}]
+        + [{"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)}]
     ).to_csv(STORE_REG_VALIDATION_OVERALL, index=False, encoding="utf-8-sig")
 
-    forecast_dates = pd.date_range(FORECAST_START, FORECAST_END, freq="D")
-    april_mode = _april_mode()
+    log("Retraining on sliding samples through March...")
+    full_anchors = anchors_with_horizon_in(
+        JAN_START, HISTORY_END, step_days=SLIDE_STEP_TRAIN_DAYS
+    )
+    full_df = build_sliding_samples(
+        panel, ID_COLS, CATEGORICAL_ENC, static_enc, full_anchors, closure
+    )
+    w_full = sample_weights_sliding(full_df)
+    t_train = time.perf_counter()
+    model_full, backend = fit_model(
+        np.nan_to_num(full_df[feat_cols].to_numpy(dtype=np.float64), nan=0.0),
+        full_df["qty_ea"].to_numpy(dtype=np.float64),
+        w_full,
+        use_gpu=use_gpu,
+    )
+    log(f"  train time: {time.perf_counter() - t_train:.1f}s")
+
+    log("Sliding April forecast...")
     t_rec = time.perf_counter()
-    if april_mode == "recursive":
-        log("Retraining on full history (Jan+Feb+Mar) for recursive April...")
-        full_df = panel_feat
-        w_full = make_sample_weights(full_df)
-        X_full = np.nan_to_num(full_df[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
-        y_full = full_df["qty_ea"].to_numpy(dtype=np.float64)
-        t_train = time.perf_counter()
-        model_full, backend = fit_model(X_full, y_full, w_full, use_gpu=use_gpu)
-        log(f"  train time: {time.perf_counter() - t_train:.1f}s")
-        log("April forecast: recursive Poisson (STORE_REG_APRIL_MODE=recursive)...")
-        daily_fc = recursive_forecast(
-            model_full, backend, panel, forecast_dates, encoders, closure
-        )
-    else:
-        log("April forecast: gap + DOW pattern (intermittent order days)...")
-        patterns = compute_tuple_order_patterns(
-            panel,
-            history_end=HISTORY_END,
-            jan_start=JAN_START,
-        )
-        daily_fc = pattern_forecast_april(
-            patterns,
-            forecast_dates,
-            closure,
-            forecast_start=FORECAST_START,
-            forecast_end=FORECAST_END,
-        )
-        log(
-            f"  pattern tuples={len(patterns):,}  "
-            f"mean gap={patterns['mean_gap_days'].mean():.2f}d  "
-            f"mean pos_rate={patterns['pos_rate'].mean():.3f}"
-        )
+    april_anchors = anchors_with_horizon_in(FORECAST_START, FORECAST_END)
+    daily_fc = sliding_forecast_period(
+        panel,
+        ID_COLS,
+        CATEGORICAL_ENC,
+        static_enc,
+        april_anchors,
+        lambda b: predict_model(
+            model_full, backend, np.nan_to_num(b[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
+        ),
+        closure,
+    )
     log(f"  April forecast total: {time.perf_counter() - t_rec:.1f}s")
 
-    name_lookup = panel[ID_COLS + ["product_name", "temperature_zone"]].drop_duplicates(ID_COLS)
+    name_lookup = panel[
+        ID_COLS + ["customer_id", "product_name", "temperature_zone"]
+    ].drop_duplicates(ID_COLS)
     daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
     daily_fc.to_csv(STORE_REG_APRIL_DAILY, index=False, encoding="utf-8-sig")
 

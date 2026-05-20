@@ -68,45 +68,16 @@ HEATMAP_TOP_N_STORES = 20
 STORE_KEYS = ["warehouse", "customer_id", "store"]
 
 
-def load_hurdle_april_dailies() -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """Pattern and per-store-calibrated April hurdle daily (excludes network scale)."""
-    if HURDLE_APRIL_DAILY_PATTERN.exists() and HURDLE_APRIL_DAILY_STORE.exists():
-        fp = pd.read_csv(HURDLE_APRIL_DAILY_PATTERN, parse_dates=["date"])
-        fs = pd.read_csv(HURDLE_APRIL_DAILY_STORE, parse_dates=["date"])
-        return fp, fs
-
-    if not (
-        HURDLE_APRIL_DAILY_NETWORK.exists()
-        and HURDLE_APRIL_CALIBRATION.exists()
-        and HURDLE_APRIL_STORE_CALIBRATION.exists()
+def load_hurdle_april_daily() -> pd.DataFrame | None:
+    """Sliding-window April hurdle daily (pattern/store/network exports are equivalent)."""
+    for path in (
+        HURDLE_APRIL_DAILY_NETWORK,
+        HURDLE_APRIL_DAILY_PATTERN,
+        HURDLE_APRIL_DAILY_STORE,
     ):
-        return None
-
-    print(
-        "[info] Deriving hurdle pattern/store daily from network-scaled export "
-        "(re-run 04b_hurdle_model.py to write dedicated CSVs)."
-    )
-    scaled = pd.read_csv(HURDLE_APRIL_DAILY_NETWORK, parse_dates=["date"])
-    cal = pd.read_csv(HURDLE_APRIL_CALIBRATION)
-    ns_row = cal.loc[cal["metric"] == "april_network_scale", "value"]
-    if ns_row.empty:
-        ns_row = cal.loc[cal["metric"] == "april_scale", "value"]
-    ns = float(ns_row.iloc[0])
-    store_scales = (
-        pd.read_csv(HURDLE_APRIL_STORE_CALIBRATION)
-        .set_index(STORE_KEYS)["store_scale"]
-        .astype(np.float64)
-    )
-    keys = scaled[STORE_KEYS].apply(tuple, axis=1)
-    mult = keys.map(store_scales).fillna(1.0).astype(np.float64).values
-    qty_scaled = scaled["qty_ea"].astype(np.float64).values
-    qty_store = qty_scaled / ns
-    qty_pattern = np.where(mult > 1e-12, qty_store / mult, qty_store)
-    fs = scaled.copy()
-    fs["qty_ea"] = qty_store
-    fp = scaled.copy()
-    fp["qty_ea"] = qty_pattern
-    return fp, fs
+        if path.exists():
+            return pd.read_csv(path, parse_dates=["date"])
+    return None
 
 
 def save(fig: plt.Figure, name: str) -> Path:
@@ -353,22 +324,19 @@ def main() -> int:
         print(f"Missing {BASELINE_APRIL_DAILY}", file=sys.stderr)
         return 1
 
-    hurdle = load_hurdle_april_dailies()
-    if hurdle is None:
-        print("Missing hurdle pattern/store daily exports.", file=sys.stderr)
+    april_hurdle = load_hurdle_april_daily()
+    if april_hurdle is None:
+        print("Missing hurdle April daily export; run 04b_hurdle_model.py.", file=sys.stderr)
         return 1
 
     april_base = pd.read_csv(BASELINE_APRIL_DAILY, parse_dates=["date"])
-    april_pattern, april_store = hurdle
 
     base_store = baseline_forecast_by_store(april_base, mart_hist)
-    pattern_store = april_pattern[["store", "date", "qty_ea"]].copy()
-    store_cal_store = april_store[["store", "date", "qty_ea"]].copy()
+    hurdle_store = april_hurdle[["store", "date", "qty_ea"]].copy()
 
     n_top = HEATMAP_TOP_N_STORES
     pt_b = store_day_matrix(base_store, top_n=n_top)
-    pt_hp = store_day_matrix(pattern_store, top_n=n_top)
-    pt_hs = store_day_matrix(store_cal_store, top_n=n_top)
+    pt_h = store_day_matrix(hurdle_store, top_n=n_top)
 
     plot_store_day_heatmap(
         pt_b,
@@ -378,78 +346,75 @@ def main() -> int:
         top_n_label=n_top,
     )
     plot_store_day_heatmap(
-        pt_hp,
-        "Hurdle pattern — April predicted qty_ea by store and day",
+        pt_h,
+        "Hurdle (sliding) — April predicted qty_ea by store and day",
         "21_april_store_day_heatmap_hurdle_pattern.png",
         cmap="magma",
         top_n_label=n_top,
     )
     plot_store_day_heatmap(
-        pt_hs,
-        "Hurdle store-cal — April predicted qty_ea by store and day",
+        pt_h,
+        "Hurdle (sliding) — April predicted qty_ea by store and day",
         "22_april_store_day_heatmap_hurdle_store.png",
         cmap="magma",
         top_n_label=n_top,
     )
 
     meta_b = pd.DataFrame({"rank": np.arange(1, len(pt_b) + 1), "store": pt_b.index})
-    meta_hp = pd.DataFrame({"rank": np.arange(1, len(pt_hp) + 1), "store": pt_hp.index})
-    meta_hs = pd.DataFrame({"rank": np.arange(1, len(pt_hs) + 1), "store": pt_hs.index})
+    meta_h = pd.DataFrame({"rank": np.arange(1, len(pt_h) + 1), "store": pt_h.index})
     meta_b.to_csv(HEATMAP_ROW_BASELINE, index=False, encoding="utf-8-sig")
-    meta_hp.to_csv(HEATMAP_ROW_HURDLE_PATTERN, index=False, encoding="utf-8-sig")
-    meta_hs.to_csv(HEATMAP_ROW_HURDLE_STORE, index=False, encoding="utf-8-sig")
+    meta_h.to_csv(HEATMAP_ROW_HURDLE_PATTERN, index=False, encoding="utf-8-sig")
+    meta_h.to_csv(HEATMAP_ROW_HURDLE_STORE, index=False, encoding="utf-8-sig")
     print(f"Wrote: {HEATMAP_ROW_BASELINE}")
     print(f"Wrote: {HEATMAP_ROW_HURDLE_PATTERN}")
     print(f"Wrote: {HEATMAP_ROW_HURDLE_STORE}")
 
-    pt_all_p, apr_ix = history_plus_april_matrix(mart_hist, pattern_store)
+    pt_all_h, apr_ix = history_plus_april_matrix(mart_hist, hurdle_store)
     plot_history_plus_april_heatmap(
-        pt_all_p,
+        pt_all_h,
         apr_ix,
-        "Hurdle pattern — store daily qty_ea: history (actual) + April (forecast)",
+        "Hurdle (sliding) — store daily qty_ea: history + April forecast",
         "23_store_history_plus_april_heatmap_hurdle_pattern.png",
-        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle pattern Apr)",
+        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle sliding Apr)",
     )
-    pd.DataFrame({"rank": np.arange(1, len(pt_all_p) + 1), "store": pt_all_p.index}).to_csv(
+    pd.DataFrame({"rank": np.arange(1, len(pt_all_h) + 1), "store": pt_all_h.index}).to_csv(
         HEATMAP_HIST_HURDLE_PATTERN, index=False, encoding="utf-8-sig"
     )
     print(f"Wrote: {HEATMAP_HIST_HURDLE_PATTERN}")
 
-    pt_all_s, _ = history_plus_april_matrix(mart_hist, store_cal_store)
     plot_history_plus_april_heatmap(
-        pt_all_s,
+        pt_all_h,
         apr_ix,
-        "Hurdle store-cal — store daily qty_ea: history (actual) + April (forecast)",
+        "Hurdle (sliding) — store daily qty_ea: history + April forecast",
         "24_store_history_plus_april_heatmap_hurdle_store.png",
-        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle store-cal Apr)",
+        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle sliding Apr)",
     )
-    pd.DataFrame({"rank": np.arange(1, len(pt_all_s) + 1), "store": pt_all_s.index}).to_csv(
+    pd.DataFrame({"rank": np.arange(1, len(pt_all_h) + 1), "store": pt_all_h.index}).to_csv(
         HEATMAP_HIST_HURDLE_STORE, index=False, encoding="utf-8-sig"
     )
     print(f"Wrote: {HEATMAP_HIST_HURDLE_STORE}")
 
-    pt_top_p = pt_all_p.head(n_top)
+    pt_top_h = pt_all_h.head(n_top)
     plot_history_plus_april_heatmap(
-        pt_top_p,
+        pt_top_h,
         apr_ix,
-        f"Hurdle pattern — top {n_top} stores: daily qty_ea history (actual) + April (forecast)",
+        f"Hurdle (sliding) — top {n_top} stores: history + April",
         "25_store_history_plus_april_heatmap_hurdle_pattern_top20.png",
-        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle pattern Apr)",
+        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle sliding Apr)",
     )
-    pd.DataFrame({"rank": np.arange(1, len(pt_top_p) + 1), "store": pt_top_p.index}).to_csv(
+    pd.DataFrame({"rank": np.arange(1, len(pt_top_h) + 1), "store": pt_top_h.index}).to_csv(
         HEATMAP_HIST_HURDLE_PATTERN_TOP20, index=False, encoding="utf-8-sig"
     )
     print(f"Wrote: {HEATMAP_HIST_HURDLE_PATTERN_TOP20}")
 
-    pt_top_s = pt_all_s.head(n_top)
     plot_history_plus_april_heatmap(
-        pt_top_s,
+        pt_top_h,
         apr_ix,
-        f"Hurdle store-cal — top {n_top} stores: daily qty_ea history (actual) + April (forecast)",
+        f"Hurdle (sliding) — top {n_top} stores: history + April",
         "26_store_history_plus_april_heatmap_hurdle_store_top20.png",
-        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle store-cal Apr)",
+        cbar_label="qty_ea (actual Jan–Mar 28 + hurdle sliding Apr)",
     )
-    pd.DataFrame({"rank": np.arange(1, len(pt_top_s) + 1), "store": pt_top_s.index}).to_csv(
+    pd.DataFrame({"rank": np.arange(1, len(pt_top_h) + 1), "store": pt_top_h.index}).to_csv(
         HEATMAP_HIST_HURDLE_STORE_TOP20, index=False, encoding="utf-8-sig"
     )
     print(f"Wrote: {HEATMAP_HIST_HURDLE_STORE_TOP20}")
@@ -460,7 +425,7 @@ def main() -> int:
         pt_sr = store_day_matrix(sr_store, top_n=n_top)
         plot_store_day_heatmap(
             pt_sr,
-            "Store regression — April predicted qty_ea by store and day",
+            "Store regression (sliding) — April predicted qty_ea by store and day",
             "32_april_store_day_heatmap_store_regression.png",
             cmap="Greens",
             top_n_label=n_top,
@@ -474,9 +439,9 @@ def main() -> int:
         plot_history_plus_april_heatmap(
             pt_all_sr,
             apr_ix_sr,
-            "Store regression — store daily qty_ea: history + April",
+            "Store regression (sliding) — store daily qty_ea: history + April",
             "33_store_history_plus_april_heatmap_store_regression.png",
-            cbar_label="qty_ea (actual Jan–Mar 28 + store regression Apr)",
+            cbar_label="qty_ea (actual Jan–Mar 28 + store reg sliding Apr)",
         )
         pd.DataFrame({"rank": np.arange(1, len(pt_all_sr) + 1), "store": pt_all_sr.index}).to_csv(
             HEATMAP_HIST_STORE_REG, index=False, encoding="utf-8-sig"
@@ -487,9 +452,9 @@ def main() -> int:
         plot_history_plus_april_heatmap(
             pt_top_sr,
             apr_ix_sr,
-            f"Store regression — top {n_top} stores: history + April",
+            f"Store regression (sliding) — top {n_top} stores: history + April",
             "34_store_history_plus_april_heatmap_store_regression_top20.png",
-            cbar_label="qty_ea (actual Jan–Mar 28 + store regression Apr)",
+            cbar_label="qty_ea (actual Jan–Mar 28 + store reg sliding Apr)",
         )
         pd.DataFrame({"rank": np.arange(1, len(pt_top_sr) + 1), "store": pt_top_sr.index}).to_csv(
             HEATMAP_HIST_STORE_REG_TOP20, index=False, encoding="utf-8-sig"

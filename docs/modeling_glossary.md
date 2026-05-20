@@ -35,6 +35,23 @@ This page defines terms used in the project [README](../README.md) and under `re
 
 ---
 
+## Sliding-window forecasting (this project)
+
+All three models share **`src/_sliding_window.py`**:
+
+| Piece | Setting |
+|-------|---------|
+| **Lookback** | Last **14 warehouse-open** days of `qty_ea` (CNY closure days skipped, not counted) |
+| **Horizon** | Predict the **next 7 calendar days** |
+| **Training/validation slide** | Move the anchor forward **1 day** (many overlapping samples) |
+| **April slide** | Move forward **7 days** (weekly blocks); use predictions from earlier April weeks in later lookbacks |
+
+Each **training example** is one tuple, one anchor, one day inside the 7-day horizon. Features include the 14 lookback values, lookback mean/std/max, whether lookback days had orders, calendar fields for the target day, and encoded warehouse/store/product IDs.
+
+**Plain language:** “What happened on the last two weeks of real operating days, and what day of the week is it?” → predict that day’s quantity for the coming week.
+
+---
+
 ## Train, validate, forecast (timeline)
 
 ```text
@@ -89,62 +106,26 @@ All metrics compare **actual** `qty_ea` to **predicted** `qty_ea`. Lower is usua
 
 ## The three forecast approaches in this repo
 
-### 1. Baseline — single Poisson regression + recursive April
+### 1. Baseline — single Poisson GBDT on sliding rows
 
-- **One model** predicts daily `qty_ea` directly (including zeros on the dense panel).
-- **Recursive April:** each day’s prediction is fed back as “yesterday” for the next day. Small errors can **add up** over April.
-- **Best when:** demand is relatively **frequent** at warehouse×customer×product grain.
+- One regressor; sliding train/validate/April.
+- **Grain:** warehouse × customer × product.
 
-### 2. Hurdle — “two hurdles” (order? × size?)
+### 2. Hurdle — classifier × size on sliding rows
 
-Named because demand must clear two steps: **(1)** an order happens, **(2)** a positive size is drawn.
+- **P(order)** from a classifier; **μ** from a Poisson regressor on positive training rows; **pred = P × μ**.
+- Same sliding April chaining as baseline.
+- **Grain:** warehouse × store × product.
 
-| Step | Model | Output |
-|------|--------|--------|
-| **Hurdle 1** | Classifier | Probability of an order day: P(order) |
-| **Hurdle 2** | Poisson regressor (trained on **positive days only**) | Expected size if an order happens: μ |
-| **Combined** | Multiply | Expected daily qty ≈ **P(order) × μ** |
+### 3. Store regression — single Poisson GBDT on sliding rows
 
-For **March validation**, the GBDT hurdle is scored on the dense panel. For **April production**, the repo uses a **pattern forecast** (below), then optional **calibration** layers.
-
-**Calibration (hurdle only):** Multiply forecasts by a constant so **average daily totals** match a target derived from January and March. This adjusts **overall level**, not the day-by-day rhythm. It is different from the store-regression **pattern** fix, which changes **which days** are non-zero.
-
-### 3. Store regression — Poisson for March, pattern for April (default)
-
-- **March:** Same spirit as baseline (one Poisson GBDT on the dense panel) for fair comparison metrics.
-- **April (default):** **Pattern continuation** (shared with hurdle Step B)—schedule sparse order days from historical **gap** and **size**, not recursive smearing.
-
-Set environment variable `STORE_REG_APRIL_MODE=recursive` only if you want the old behavior (not recommended for intermittent stores).
+- Same sliding protocol as baseline at store grain; optional GPU (XGBoost).
 
 ---
 
-## Pattern forecast (gap + day-of-week)
+## Legacy: pattern forecast (not used in `main()` anymore)
 
-Used for **April** in hurdle (pattern path) and store regression (default).
-
-| Idea | Plain English |
-|------|----------------|
-| **Inter-order gap** | Typical number of days between order days (e.g. ~7 for weekly). |
-| **Last order date** | Anchor the schedule: “next order ≈ last order + gap.” |
-| **Day-of-week (DOW) filter** | Skip proposed days that historically rarely had orders (e.g. never order on Sunday). |
-| **Order size on hit days** | Use a robust typical quantity on positive history days (blend of recent median/mean and longer history). |
-
-Result: most days stay **zero**; a few days get **larger** quantities—similar to how many stores actually order.
-
----
-
-## Why Poisson + recursion can look wrong on heatmaps
-
-A **heatmap** colors each store×day by total predicted `qty_ea` (summed over products).
-
-If the model predicts a **small positive** on every day:
-
-- The heatmap shows “activity” almost every day (high **order frequency**).
-- Each day’s total is **small**, so colors look weak compared to history’s “big spike once a week.”
-
-That is **not** fixed by multiplying all numbers by a constant (scaling the mean). You need to fix **when** orders happen (pattern / hurdle classifier) or **threshold** sparse decisions.
-
-Diagnostic script: `scripts/diagnose_store_intermittency.py` (example store: 深圳南太云创谷店).
+Older versions scheduled April order days from **gap + day-of-week** rules (`src/_pattern_forecast.py`). The current pipeline uses **sliding windows** for April on all models. Pattern helpers remain for experiments.
 
 ---
 
