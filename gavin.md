@@ -1,144 +1,80 @@
 # Task 2 Modeling Handoff
 
-## Current Status
+## Current Model
 
-The active work is now a separate category/product/week/day forecasting path. The vanilla baseline, hurdle model, store-regression model, shared sliding-window helper, and original requirements were restored to the Git baseline for clean collaboration.
+The active model is **not** the hurdle model and **not** the store-regression model. It is a separate deterministic hierarchical forecasting system:
 
-The current model is **neither the hurdle model nor the store-regression model**. It is a deterministic hierarchical forecasting system:
+1. forecast broad product-category weekly demand;
+2. apply known-ahead calendar and accepted price-regime signals as bounded systematic context;
+3. allocate category-week totals into category-day, product-week, product-day, and hour-level outputs;
+4. reconcile every child layer back to its parent total.
 
-1. predict broad product-category weekly demand;
-2. use calendar and price-regime sidecars as bounded systematic adjustments;
-3. allocate category-week totals into category-day, product-week, and product-day outputs;
-4. reconcile child predictions back to parent totals.
+March is the validation month. April is the real forecast target; April WMAPE is not reported because April actual labels are not present.
 
-## Most Important Files
+## Active Files
 
-### Primary Modeling Code
+- `src/14_tagged_weekly.py`: builds product tags, systematic calendar/price sidecars, and the selected category-week parent forecast.
+- `src/15_granularity.py`: allocates category-week into category-day, product-week, and product-day; selects the reconciled product-day system.
+- `src/17_hourly_customer_granularity.py`: validates day-to-hour and customer-category layers using real `create_time` order timestamps; also writes April hourly forecast artifacts.
+- `src/16_error_charts.py`: creates the two composite 2x3 chart grids for grouped/customer by weekly/daily/hourly views.
 
-- `src/14_tagged_weekly.py`
-  - Builds product/order tags.
-  - Builds systematic calendar and price-regime features.
-  - Selects the deployable category-week parent forecast.
-  - This is the most important model file.
-
-- `src/15_granularity.py`
-  - Takes the selected category-week parent forecast.
-  - Allocates it into category-day, product-week, and product-day predictions.
-  - Runs reconciliation and production-granularity validation.
-  - This is the second most important model file.
-
-- `src/16_error_charts.py`
-  - Generates the focused six-chart error pack.
-  - It does not change model outputs.
-
-### Required Data Artifacts
+Required data artifacts:
 
 - `processed/tagging/product_order_tags.csv`
-- `external_data/processed/product_category_mapping.csv`
-- `external_data/processed/timor_calendar_daily.csv`
-- `external_data/processed/systematic_day_tags.csv`
-- `external_data/processed/systematic_week_tags.csv`
-- `external_data/processed/xinfadi_category_daily_prices.csv`
-- `external_data/processed/mofcom_weekly_prices.csv`
-- `external_data/processed/weekly_price_regime_tags.csv`
-
-The three `src` files are enough for code review, but not enough for reproduction. To run the current path, the data artifacts above must also be provided.
-
-## Current Metrics
-
-### Category-Week Parent Forecast
-
-Selected model:
-
-- `monthly_price_regime_elasticity_-0.15_scale_1.0125__share_calendar_systematic_final_shrink_0.25`
-
-Validation metrics:
-
-| Metric | Value |
-|---|---:|
-| Weekly WMAPE | `0.035964` |
-| Bias ratio | `-0.016277` |
-| Actual total | `1,253,486.62` |
-| Predicted total | `1,233,083.05` |
-| Max single-week WMAPE | `0.078085` |
-| Prior selected product-category WMAPE | `0.074341` |
-| Relative improvement vs prior | `51.62%` |
-
-This layer is the current reliable anchor.
-
-### Production Granularity Allocation
-
-| Layer | Selected model | WMAPE | Target | Target met |
-|---|---|---:|---:|---|
-| Category-week | selected tagged-systematic parent | `0.035964` | `0.0500` | Yes |
-| Category-day | `category_day_frontload_58_42_00` | `0.111988` | `0.0500` | No |
-| Product-week | `product_week_feb_share` | `0.117724` | `0.0500` | No |
-| Product-day | `product_day_product_dow_ipf` | `0.193312` | `0.1000` | No |
-
-All reconciliation checks pass. The remaining weakness is predictive allocation error, not arithmetic inconsistency.
-
-## Model Basis
-
-The active model is based on:
-
-- product category grouping;
-- deterministic product tags;
-- known-ahead calendar structure;
-- bounded price-regime adjustment;
-- historical weekly shares;
-- day-of-week allocation;
-- product-share allocation;
-- exact hierarchical reconciliation.
-
-It is **not** based on:
-
-- the hurdle model;
-- the store-regression model;
-- direct row-level external-data regression;
-- neural sequence models.
-
-The hurdle model remains useful as a clean baseline and as your friend's original modeling path. It is not part of the current selected category/product/week/day system.
-
-## What To Give A Collaborator
-
-For reviewing the new modeling logic:
-
-- `src/14_tagged_weekly.py`
-- `src/15_granularity.py`
-- `src/16_error_charts.py`
-- `gavin.md`
-
-For reproducing the current outputs, also give:
-
-- `processed/tagging/product_order_tags.csv`
-- all retained files in `external_data/processed/`
+- `external_data/processed/*.csv`
 - `reports/weekly_tagged_systematic/`
 - `reports/production_granularity/`
 
-For historical audit only:
+## Latest March Validation Metrics
 
-- `legacy/`
+| Layer | Selected model | WMAPE | Target | Status |
+|---|---|---:|---:|---|
+| Grouped category-week | selected tagged-systematic parent | `0.035964` | `0.0500` | Pass |
+| Grouped category-day | `category_day_frontload_58_42_00` | `0.111988` | `0.0700` | Fail |
+| Product-week | `product_week_recency_alpha_1.05` | `0.116388` | `0.0500` | Fail |
+| Product-day | `product_day__product_week_recency_alpha_1.05__product_dow_ipf` | `0.193005` | `0.1000` | Fail |
+| Grouped category-hour | `category_hour_calendar_daytype_shrink_k1000` | `0.326187` | `0.1200` | Fail |
+| Product-hour | `product_hour_product_hour_shrink_k500` | `0.475246` | `0.3000` | Fail |
+| Customer-category week | `customer_category_janfeb_share` | `0.087310` | `0.1200` | Pass |
+| Customer-category day | `customer_category_janfeb_share` | `0.161023` | `0.1800` | Pass |
+| Customer-category hour | `customer_category_janfeb_share` | `0.492230` | `0.2500` | Fail |
+
+All reconciliation checks pass for category-day, product-week, product-day, category-hour, product-hour, and customer-category outputs.
+
+## External Data Result
+
+External data helps only when used as systematic context, not as direct raw regressors.
+
+- Weekly parent forecast uses calendar and price-regime context and remains strong at `0.035964` WMAPE.
+- Hourly calendar day-type conditioning improves grouped-hour WMAPE from `0.333997` to `0.326187`, so it is accepted for the hourly layer.
+- Weather and other direct external sources are not promoted in the active path.
+
+## April Forecast Status
+
+`src/17_hourly_customer_granularity.py --mode forecast` writes April forecast artifacts under:
+
+- `reports/production_granularity/hourly_customer/april_category_day_forecast.csv`
+- `reports/production_granularity/hourly_customer/april_category_hour_forecast.csv`
+- `reports/production_granularity/hourly_customer/april_forecast_note.md`
+
+These are forecasts only. They are not validation results.
+
+## Charts
+
+`src/16_error_charts.py` now produces exactly two chart files:
+
+- `reports/production_granularity/error_charts/01_actual_pred_line_grid.png`
+- `reports/production_granularity/error_charts/02_error_bar_grid.png`
+
+Each figure contains six panels: grouped/customer rows by weekly/daily/hourly columns.
 
 ## Production Readiness
 
-The project is closer to production level but not production-grade yet.
+The project is not production-grade yet. The reliable part is the category-week anchor. The remaining prediction gaps are:
 
-What is strong:
+- daily timing error below category-week;
+- product-mix volatility, especially new or returning March products with little Jan-Feb history;
+- hourly concentration around operational order-entry windows;
+- customer/category allocation sparsity.
 
-- category-week forecasting;
-- exact reconciliation;
-- clean separation from the vanilla code;
-- concise active pipeline.
-
-What is still weak:
-
-- category-day timing;
-- product-week product-mix allocation;
-- product-day sparse demand;
-- proof across more than one validation month.
-
-The next real improvement should focus on allocation quality: product lifecycle detection, new/returning product handling, day-of-week behavior by product family, and customer/store allocation. The category-week parent is no longer the main bottleneck.
-
-## Cleanup Boundary
-
-Quarantined exploratory work is under `legacy/`. Original vanilla files were not moved there. The current active surface is intentionally small: scripts `14`, `15`, `16`, processed sidecars, current reports, and this handoff.
+The next improvement should focus on product lifecycle detection, customer-specific cadence, and a better allocation model for sparse products/customers. The hurdle model remains useful as a clean baseline for comparison, but it is not part of the selected active hierarchy.

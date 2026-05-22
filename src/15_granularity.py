@@ -270,7 +270,7 @@ def product_share_candidates(df: pd.DataFrame, parent: pd.DataFrame, products: p
     febw = hist[hist["month"] == "2026-02"].groupby(prod_cols, as_index=False)["qty_ea"].sum().rename(columns={"qty_ea": "feb"})
     rec = products.merge(jan, on=prod_cols, how="left").merge(febw, on=prod_cols, how="left")
     rec[["jan", "feb"]] = rec[["jan", "feb"]].fillna(0.0)
-    for alpha in [0.60, 0.75, 0.90]:
+    for alpha in [0.60, 0.75, 0.90, 1.05, 1.10, 1.15, 1.20]:
         w = rec[prod_cols].copy()
         w["weight"] = (1 - alpha) * w.join(rec["jan"])["jan"] + alpha * rec["feb"]
         candidates[f"product_week_recency_alpha_{alpha:.2f}"] = make_from_weights(w, f"product_week_recency_alpha_{alpha:.2f}")
@@ -563,15 +563,18 @@ def main() -> int:
         )
         metric_rows.append(row)
         prod_week_joined_by_model[name] = joined
-    selected_prod_week = select_best(metric_rows, "product_week")
-    product_week_pred = prod_week_candidates[selected_prod_week.model].copy()
-    product_week_joined = prod_week_joined_by_model[selected_prod_week.model]
+    log("Combining product-week candidates into product-day forecasts...")
+    product_day_candidates = {}
+    product_day_source_week: dict[str, str] = {}
+    for week_name, week_pred in prod_week_candidates.items():
+        share_name = f"product_day__{week_name}__category_day_share"
+        ipf_name = f"product_day__{week_name}__product_dow_ipf"
+        product_day_candidates[share_name] = product_day_from_layers(week_pred, category_day_pred, share_name)
+        product_day_source_week[share_name] = week_name
+        product_day_candidates[ipf_name] = product_dow_ipf(df, week_pred, category_day_pred)
+        product_day_candidates[ipf_name]["allocation_model"] = ipf_name
+        product_day_source_week[ipf_name] = week_name
 
-    log("Combining selected layers into product-day forecasts...")
-    product_day_candidates = {
-        "product_day_category_day_share": product_day_from_layers(product_week_pred, category_day_pred, "product_day_category_day_share"),
-        "product_day_product_dow_ipf": product_dow_ipf(df, product_week_pred, category_day_pred),
-    }
     prod_day_joined_by_model = {}
     for name, pred in product_day_candidates.items():
         row, joined = metric(
@@ -586,6 +589,10 @@ def main() -> int:
         metric_rows.append(row)
         prod_day_joined_by_model[name] = joined
     selected_prod_day = select_best(metric_rows, "product_day")
+    selected_week_for_day = product_day_source_week[selected_prod_day.model]
+    selected_prod_week = next(r for r in metric_rows if r.layer == "product_week" and r.model == selected_week_for_day)
+    product_week_pred = prod_week_candidates[selected_prod_week.model].copy()
+    product_week_joined = prod_week_joined_by_model[selected_prod_week.model]
     product_day_pred = product_day_candidates[selected_prod_day.model].copy()
     product_day_joined = prod_day_joined_by_model[selected_prod_day.model]
 

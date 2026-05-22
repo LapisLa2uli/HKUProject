@@ -199,12 +199,15 @@ def load_and_tag_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def build_systematic_day_tags() -> pd.DataFrame:
-    dates = pd.date_range("2026-01-01", "2026-03-31", freq="D")
-    day = pd.DataFrame({"date": dates})
     if TIMOR_CALENDAR.exists():
         cal = pd.read_csv(TIMOR_CALENDAR, parse_dates=["date"])
+        max_date = max(pd.Timestamp("2026-04-30"), cal["date"].max())
+        dates = pd.date_range("2026-01-01", max_date, freq="D")
+        day = pd.DataFrame({"date": dates})
         day = day.merge(cal, on="date", how="left")
     else:
+        dates = pd.date_range("2026-01-01", "2026-04-30", freq="D")
+        day = pd.DataFrame({"date": dates})
         day["timor_is_holiday"] = 0
         day["timor_is_adjusted_workday"] = 0
         day["timor_holiday_name"] = ""
