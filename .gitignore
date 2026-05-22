@@ -1,6 +1,12 @@
 # Raw warehouse extracts — place your own files under Data/ (see README)
 /Data/
 
+# Quarantined legacy work
+/legacy/
+
+# Temporary package exports
+/gavin522_*.zip
+
 # Generated pipeline outputs (CSV tables); regenerate with scripts under src/
 /processed/
 
