@@ -1,0 +1,204 @@
+{
+  "generated_at": "2026-05-22T20:54:32.697094+08:00",
+  "parent_model": "selected_tagged_systematic_parent",
+  "parent_category_week_wmape": 0.035964278717383905,
+  "parent_category_week_target_met": true,
+  "selected_category_day_model": "category_day_frontload_58_42_00",
+  "category_day_wmape": 0.11198793184273716,
+  "category_day_target_met": false,
+  "selected_product_week_model": "product_week_recency_alpha_1.05",
+  "product_week_wmape": 0.11638803611785213,
+  "product_week_target_met": false,
+  "selected_product_day_model": "product_day__product_week_recency_alpha_1.05__product_dow_ipf",
+  "product_day_wmape": 0.19300509647680766,
+  "product_day_target_met": false,
+  "all_reconciliation_checks_passed": true,
+  "production_ready": false,
+  "dominant_product_week_errors": [
+    {
+      "product_reference_group": "vegetables",
+      "product_id": "GS000522592",
+      "product_name": "雪里蕻41-BW",
+      "week_of_month": 4,
+      "qty_ea": 6133.0,
+      "pred": 0.0,
+      "abs_error": 6133.0
+    },
+    {
+      "product_reference_group": "vegetables",
+      "product_id": "GS000522673",
+      "product_name": "红烧香菇29-BW",
+      "week_of_month": 4,
+      "qty_ea": 5869.0,
+      "pred": 0.0,
+      "abs_error": 5869.0
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000012840",
+      "product_name": "窖香脆卜装-BW",
+      "week_of_month": 1,
+      "qty_ea": 51901.0,
+      "pred": 47396.037891520864,
+      "abs_error": 4504.962108479136
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000086883",
+      "product_name": "经典东北定制大米10kg精选-BW",
+      "week_of_month": 1,
+      "qty_ea": 25565.0,
+      "pred": 22054.058286566556,
+      "abs_error": 3510.9417134334435
+    },
+    {
+      "product_reference_group": "vegetables",
+      "product_id": "GS000522592",
+      "product_name": "雪里蕻41-BW",
+      "week_of_month": 3,
+      "qty_ea": 3463.0,
+      "pred": 0.0,
+      "abs_error": 3463.0
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000522580",
+      "product_name": "改良江四爷非遗腊八豆（原味）优选-BW",
+      "week_of_month": 4,
+      "qty_ea": 3086.0,
+      "pred": 0.0,
+      "abs_error": 3086.0
+    },
+    {
+      "product_reference_group": "vegetables",
+      "product_id": "GS000012837",
+      "product_name": "外婆菜74-BW",
+      "week_of_month": 1,
+      "qty_ea": 18496.0,
+      "pred": 16007.436437654262,
+      "abs_error": 2488.5635623457383
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000522580",
+      "product_name": "改良江四爷非遗腊八豆（原味）优选-BW",
+      "week_of_month": 3,
+      "qty_ea": 2239.0,
+      "pred": 0.0,
+      "abs_error": 2239.0
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000034841",
+      "product_name": "肥膘片嫩-BW",
+      "week_of_month": 1,
+      "qty_ea": 17470.0,
+      "pred": 15274.749088016215,
+      "abs_error": 2195.250911983785
+    },
+    {
+      "product_reference_group": "meats",
+      "product_id": "GS000012829",
+      "product_name": "瘦肉片版-BW",
+      "week_of_month": 1,
+      "qty_ea": 41036.0,
+      "pred": 39054.241473243885,
+      "abs_error": 1981.7585267561153
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000014771",
+      "product_name": "豆干（1KG/包）品-BW",
+      "week_of_month": 1,
+      "qty_ea": 20532.0,
+      "pred": 18640.19600169774,
+      "abs_error": 1891.8039983022609
+    },
+    {
+      "product_reference_group": "meats",
+      "product_id": "GS000287913",
+      "product_name": "火山石烤肠(黑胡椒味)嫩-BW",
+      "week_of_month": 4,
+      "qty_ea": 11870.0,
+      "pred": 10069.942813303138,
+      "abs_error": 1800.0571866968621
+    },
+    {
+      "product_reference_group": "meats",
+      "product_id": "GS000442656",
+      "product_name": "优质腊肉片（常温款）款-BW",
+      "week_of_month": 4,
+      "qty_ea": 4605.0,
+      "pred": 6351.43522118888,
+      "abs_error": 1746.43522118888
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000012840",
+      "product_name": "窖香脆卜装-BW",
+      "week_of_month": 3,
+      "qty_ea": 45665.0,
+      "pred": 47396.037891520864,
+      "abs_error": 1731.037891520864
+    },
+    {
+      "product_reference_group": "meats",
+      "product_id": "GS000442656",
+      "product_name": "优质腊肉片（常温款）款-BW",
+      "week_of_month": 2,
+      "qty_ea": 4628.0,
+      "pred": 6302.19928924168,
+      "abs_error": 1674.1992892416802
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000034841",
+      "product_name": "肥膘片嫩-BW",
+      "week_of_month": 3,
+      "qty_ea": 16730.0,
+      "pred": 15274.749088016215,
+      "abs_error": 1455.250911983785
+    },
+    {
+      "product_reference_group": "meats",
+      "product_id": "GS000442656",
+      "product_name": "优质腊肉片（常温款）款-BW",
+      "week_of_month": 3,
+      "qty_ea": 4875.0,
+      "pred": 6302.19928924168,
+      "abs_error": 1427.1992892416802
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000086883",
+      "product_name": "经典东北定制大米10kg精选-BW",
+      "week_of_month": 2,
+      "qty_ea": 23453.0,
+      "pred": 22054.058286566556,
+      "abs_error": 1398.9417134334435
+    },
+    {
+      "product_reference_group": "other",
+      "product_id": "GS000014771",
+      "product_name": "豆干（1KG/包）品-BW",
+      "week_of_month": 3,
+      "qty_ea": 17323.0,
+      "pred": 18640.19600169774,
+      "abs_error": 1317.1960016977391
+    },
+    {
+      "product_reference_group": "meats",
+      "product_id": "GS000287913",
+      "product_name": "火山石烤肠(黑胡椒味)嫩-BW",
+      "week_of_month": 3,
+      "qty_ea": 11266.0,
+      "pred": 9991.881241106992,
+      "abs_error": 1274.118758893008
+    }
+  ],
+  "notes": [
+    "Allocation shares are estimated from Jan-Feb only.",
+    "March actuals are used only for validation.",
+    "All selected predictions reconcile back to the selected category-week parent forecast."
+  ]
+}
