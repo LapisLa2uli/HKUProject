@@ -32,6 +32,7 @@ HORIZON_CAL_COLS = [
     "horizon_month",
     "horizon_weekofyear",
     "horizon_is_weekend",
+    "horizon_wom",
 ]
 HORIZON_IDX_COL = "horizon_day_index"
 CNY_COLS = ["is_cny_window", "is_warehouse_closed", "days_to_cny", "days_from_cny"]
@@ -71,7 +72,7 @@ def anchors_with_horizon_in(
     last_anchor = he - pd.Timedelta(days=HORIZON_DAYS - 1)
     if last_anchor < first_anchor:
         return pd.DatetimeIndex([])
-    return weekly_anchors(first_anchor, last_anchor, step_days=step_days)
+    return weekly_anchors(first_anchor, he, step_days=step_days)
 
 
 def sliding_feature_columns(categorical_enc_cols: list[str]) -> list[str]:
@@ -103,12 +104,14 @@ def _last_k_open_rows(open_before: np.ndarray, k: int) -> tuple[np.ndarray, np.n
 def _horizon_calendar_matrix(dates: pd.DatetimeIndex | np.ndarray) -> dict[str, np.ndarray]:
     d = pd.DatetimeIndex(dates).normalize()
     dow = np.asarray(d.dayofweek, dtype=np.int16)
+    dom = np.asarray(d.day, dtype=np.int16)
     return {
         "horizon_dow": dow,
-        "horizon_dom": np.asarray(d.day, dtype=np.int16),
+        "horizon_dom": dom,
         "horizon_month": np.asarray(d.month, dtype=np.int16),
         "horizon_weekofyear": np.asarray(d.isocalendar().week, dtype=np.int16),
         "horizon_is_weekend": (dow >= 5).astype(np.int8),
+        "horizon_wom": np.clip((dom - 1) // 7 + 1, 1, 5).astype(np.int16),
     }
 
 

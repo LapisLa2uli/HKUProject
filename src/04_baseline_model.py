@@ -40,6 +40,7 @@ from _report_paths import (
     BASELINE_APRIL_MONTHLY_CP,
     BASELINE_APRIL_MONTHLY_WCP,
     BASELINE_APRIL_MONTHLY_WH,
+    BASELINE_VALIDATION_DAILY,
     BASELINE_VALIDATION_MONTHLY,
     BASELINE_VALIDATION_OVERALL,
     BASELINE_VALIDATION_PER_CUSTOMER,
@@ -297,6 +298,9 @@ def main() -> int:
 
     diag = valid_open[ID_COLS + ["date", "qty_ea"]].copy()
     diag["pred"] = np.clip(valid_pred, 0, None)
+    diag.groupby(ID_COLS + ["date"], as_index=False).agg(
+        qty_ea=("qty_ea", "first"), pred=("pred", "mean")
+    ).to_csv(BASELINE_VALIDATION_DAILY, index=False, encoding="utf-8-sig")
 
     log("Per-warehouse validation metrics:")
     per_wh = (

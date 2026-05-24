@@ -88,13 +88,15 @@ def fit_regressor(
         return booster, "xgboost_cuda"
     from sklearn.ensemble import HistGradientBoostingRegressor
 
+    p = params or {}
     model = HistGradientBoostingRegressor(
         loss="poisson",
-        learning_rate=(params or {}).get("learning_rate", 0.06),
+        learning_rate=p.get("learning_rate", 0.06),
         max_iter=num_boost_round,
-        max_leaf_nodes=63,
-        min_samples_leaf=40,
-        l2_regularization=0.0,
+        max_leaf_nodes=p.get("max_leaves", 63),
+        max_depth=p.get("max_depth", None),
+        min_samples_leaf=p.get("min_samples_leaf", 40),
+        l2_regularization=p.get("lambda", 0.0),
         early_stopping=False,
         random_state=42,
     )

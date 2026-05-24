@@ -73,6 +73,7 @@ from _report_paths import (
     HURDLE_VALIDATION_CLASSIFIER,
     HURDLE_VALIDATION_INTERMITTENT,
     HURDLE_VALIDATION_PLANNING,
+    HURDLE_VALIDATION_DAILY,
     HURDLE_TRAINING_MONITOR,
     HURDLE_VALIDATION_MONTHLY,
     HURDLE_VALIDATION_OVERALL,
@@ -122,6 +123,38 @@ TRAIN_CONVERGENCE_PATIENCE = 3
 ROLL_QTY_MIN_FRAC_SEED = 0.35  # rolling buffer qty >= max(pred, frac * seed_qty)
 # When tuning prior blend: tiny weight on decision-rule SMAPE (see tune_prior_hyperparams).
 PRIOR_TUNE_DECISION_SMAPE_WEIGHT = 0.04
+PRIOR_TUNE_WMAPE_WEIGHT = 0.30
+THRESHOLD_TUNE_WMAPE_WEIGHT = 0.55
+THRESHOLD_TUNE_PLANNING_WEIGHT = 0.40
+PRIOR_TUNE_PLANNING_WEIGHT = 0.25
+ORDER_PROB_THRESHOLD_GRID = [
+    0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50,
+]
+# Soft hurdle (P×μ) distributes volume proportionally; avoids binary noise from weak classifier.
+SOFT_HURDLE_VOLUME = True
+PRIOR_TUNE_ORDER_THRESHOLD = 0.10
+PRIOR_TUNE_WEEKLY_WMAPE_WEIGHT = 0.30
+
+CADENCE_FEATURE_COLS = [
+    "lb_order_count",
+    "lb_days_since_order",
+    "lb_mean_order_gap",
+    "lb_gap_phase",
+    "lb_cv",
+    "lb_mean_x_hidx",
+    "lb_nonzero_ratio_x_hidx",
+    "lb_trend",
+]
+VOLUME_SCALE_CLIP_LO = 0.80
+VOLUME_SCALE_CLIP_HI = 1.45
+
+DOW_CALIBRATION_CLIP_LO = 0.30
+DOW_CALIBRATION_CLIP_HI = 3.0
+DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+ANCHOR_CAL_SHRINKAGE = 0.65
+ANCHOR_CAL_CLIP_LO = 0.70
+ANCHOR_CAL_CLIP_HI = 1.45
 
 # April network-level calibration toward (Q_Jan + Q_Mar) / 2 on dense panel.
 APRIL_SCALE_MIN = 0.5
@@ -144,6 +177,56 @@ STORE_CALIBRATION_CLIP_HI = 3.5
 HURDLE_DAILY_PATTERN_CSV = HURDLE_APRIL_DAILY_PATTERN.name
 HURDLE_DAILY_STORE_CSV = HURDLE_APRIL_DAILY_STORE.name
 HURDLE_DAILY_NETWORK_CSV = HURDLE_APRIL_DAILY_NETWORK.name
+
+
+def fit_network_volume_scale(actual_sum: float, pred_sum: float) -> float:
+    """March-derived network scale for deployable volume calibration."""
+    if pred_sum <= 0 or actual_sum <= 0:
+        return 1.0
+    return float(np.clip(actual_sum / pred_sum, VOLUME_SCALE_CLIP_LO, VOLUME_SCALE_CLIP_HI))
+
+
+def apply_volume_scale(df: pd.DataFrame, scale: float, qty_col: str = "qty_ea") -> pd.DataFrame:
+    out = df.copy()
+    out[qty_col] = out[qty_col].astype(np.float64) * scale
+    if "mu_qty" in out.columns:
+        out["mu_qty"] = out["mu_qty"].astype(np.float64) * scale
+    return out
+
+
+def compute_dow_calibration(
+    dates: pd.Series | np.ndarray,
+    actual: np.ndarray,
+    predicted: np.ndarray,
+) -> np.ndarray:
+    """Per-DOW scale factors so aggregate predicted volume matches actual per day-of-week."""
+    dow = pd.DatetimeIndex(pd.to_datetime(dates)).dayofweek.values
+    scales = np.ones(7, dtype=np.float64)
+    for d in range(7):
+        mask = dow == d
+        if mask.sum() == 0:
+            continue
+        a = float(np.asarray(actual, dtype=np.float64)[mask].sum())
+        p = float(np.asarray(predicted, dtype=np.float64)[mask].sum())
+        if p > 0 and a > 0:
+            scales[d] = np.clip(a / p, DOW_CALIBRATION_CLIP_LO, DOW_CALIBRATION_CLIP_HI)
+    return scales
+
+
+def apply_dow_calibration_to_df(
+    df: pd.DataFrame,
+    dow_scales: np.ndarray,
+    date_col: str = "date",
+    qty_col: str = "qty_ea",
+) -> pd.DataFrame:
+    """Multiply per-row qty (and mu_qty) by the DOW scale for that row's date."""
+    out = df.copy()
+    dow = pd.to_datetime(out[date_col]).dt.dayofweek.values
+    mult = dow_scales[dow].astype(np.float64)
+    out[qty_col] = out[qty_col].astype(np.float64) * mult
+    if "mu_qty" in out.columns:
+        out["mu_qty"] = out["mu_qty"].astype(np.float64) * mult
+    return out
 
 
 def write_hurdle_daily_csv(
@@ -296,9 +379,10 @@ def calibrate_april_per_store(
 
     out = daily_fc.copy()
     out["qty_ea"] = out["qty_ea"].astype(np.float64) * mult_arr
-    out["mu_qty"] = out["mu_qty"].astype(np.float64) * mult_arr
-    mu = np.maximum(out["mu_qty"].astype(np.float64).values, 1e-9)
-    out["p_order"] = np.clip(out["qty_ea"].values / mu, 0.0, 1.0)
+    if "mu_qty" in out.columns:
+        out["mu_qty"] = out["mu_qty"].astype(np.float64) * mult_arr
+        mu = np.maximum(out["mu_qty"].astype(np.float64).values, 1e-9)
+        out["p_order"] = np.clip(out["qty_ea"].values / mu, 0.0, 1.0)
     return out, merged
 
 
@@ -563,6 +647,63 @@ def add_calendar(df: pd.DataFrame) -> pd.DataFrame:
     df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
     df["dom_sin"] = np.sin(2 * np.pi * (dom - 1.0) / 30.0)
     df["dom_cos"] = np.cos(2 * np.pi * (dom - 1.0) / 30.0)
+    return df
+
+
+def enrich_sliding_cadence(df: pd.DataFrame) -> pd.DataFrame:
+    """Add cadence and interaction features derived from lookback columns (lb_1…lb_14)."""
+    df = df.copy()
+    lb_cols = [f"lb_{i}" for i in range(1, LOOKBACK_OPEN_DAYS + 1)]
+    missing = [c for c in lb_cols if c not in df.columns]
+    if missing:
+        return df
+    lb = df[lb_cols].values.astype(np.float64)
+    n, k = lb.shape
+    nz = lb > 0
+
+    order_count = nz.sum(axis=1).astype(np.float64)
+    df["lb_order_count"] = order_count
+
+    has_any = nz.any(axis=1)
+    first_nz = nz.argmax(axis=1).astype(np.float64)
+    df["lb_days_since_order"] = np.where(has_any, first_nz + 1.0, float(k + 1))
+
+    nz_rev = nz[:, ::-1]
+    oldest_fwd = (k - 1) - nz_rev.argmax(axis=1).astype(np.float64)
+    newest_fwd = first_nz
+    span = (oldest_fwd - newest_fwd).astype(np.float64)
+    mean_gap = np.where(
+        order_count >= 2,
+        np.clip(span / np.maximum(order_count - 1.0, 1.0), 1.0, float(k)),
+        7.0,
+    )
+    mean_gap = np.where(has_any, mean_gap, 7.0)
+    df["lb_mean_order_gap"] = mean_gap
+
+    df["lb_gap_phase"] = df["lb_days_since_order"].values / np.maximum(mean_gap, 1.0)
+
+    pos_vals = np.where(nz, lb, np.nan)
+    with np.errstate(all="ignore"):
+        pos_mean = np.nanmean(pos_vals, axis=1)
+        pos_std = np.nanstd(pos_vals, axis=1)
+    cv = np.where(pos_mean > 0, pos_std / pos_mean, 0.0)
+    df["lb_cv"] = np.nan_to_num(cv, nan=0.0)
+
+    hidx = df.get("horizon_day_index", pd.Series(np.zeros(n))).values.astype(np.float64)
+    lb_mean = df["lb_mean"].values.astype(np.float64) if "lb_mean" in df.columns else np.zeros(n)
+    nz_ratio = (
+        df["lb_nonzero_ratio"].values.astype(np.float64)
+        if "lb_nonzero_ratio" in df.columns
+        else (order_count / k)
+    )
+    df["lb_mean_x_hidx"] = lb_mean * hidx
+    df["lb_nonzero_ratio_x_hidx"] = nz_ratio * hidx
+
+    half = k // 2
+    older = lb[:, half:].sum(axis=1).astype(np.float64)
+    newer = lb[:, :half].sum(axis=1).astype(np.float64)
+    df["lb_trend"] = np.where(older > 0, newer / np.maximum(older, 1e-9) - 1.0, 0.0)
+
     return df
 
 
@@ -1131,6 +1272,7 @@ def predict_hurdle(
     prior_k: float | None = None,
     prob_calibrator: IsotonicRegression | None = None,
     order_threshold: float | None = None,
+    soft_volume: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     X_arr = X.to_numpy(dtype=np.float64) if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=np.float64)
     p_raw = apply_probability_calibrator(
@@ -1147,8 +1289,13 @@ def predict_hurdle(
         p = (1.0 - lam) * p_raw + lam * p_prior
         p = np.clip(p, 0.0, 1.0)
     tau = ORDER_PROB_THRESHOLD if order_threshold is None else float(order_threshold)
-    order = (p >= tau).astype(np.float64)
-    pred = np.clip(order * mu, 0, None)
+    use_soft = SOFT_HURDLE_VOLUME if soft_volume is None else bool(soft_volume)
+    pred_soft = np.clip(p * mu, 0, None)
+    if use_soft:
+        pred = pred_soft
+    else:
+        order = (p >= tau).astype(np.float64)
+        pred = np.clip(order * mu, 0, None)
     return pred, p, mu
 
 
@@ -1164,9 +1311,8 @@ def tune_prior_hyperparams(
 ) -> tuple[float, float]:
     """Pick (blend_lambda, prior_k) from March validation.
 
-    Primary objective: monthly tuple totals bias_ratio nearest 1.
-    Secondary (tie-break / gentle pull): lower hard-hurdle SMAPE on daily rows
-    (same rule as ``predict_hurdle``: μ if P(order) >= threshold else 0).
+    Primary objective: monthly tuple totals |bias_ratio| nearest 0.
+    Secondary: lower monthly WMAPE and hard-hurdle SMAPE on daily rows.
     """
     X = valid_open[feat_cols].fillna(0.0)
     pr = valid_open["pos_rate_train"].values
@@ -1190,17 +1336,37 @@ def tune_prior_hyperparams(
                 clf, reg, X, pr, blend_lambda=lam, prior_k=k,
                 clf_backend=clf_backend, reg_backend=reg_backend,
                 prob_calibrator=prob_calibrator,
+                order_threshold=PRIOR_TUNE_ORDER_THRESHOLD,
+                soft_volume=SOFT_HURDLE_VOLUME,
             )
-            pred_df = valid_open[keys].copy()
+            pred_df = valid_open[keys + ["date", "qty_ea"]].copy()
             pred_df["pred"] = pred
             pred_m = pred_df.groupby(keys, as_index=False)["pred"].sum()
             merged = actual_m.merge(pred_m, on=keys, how="inner")
             if merged["actual"].sum() <= 0:
                 continue
             br = bias_ratio(merged["actual"].values, merged["pred"].values)
-            br_err = abs(br - 1.0)
-            sm_dec = evaluate_arrays(y_daily, pred)["smape"]
-            score = br_err + PRIOR_TUNE_DECISION_SMAPE_WEIGHT * sm_dec
+            br_err = abs(br)
+            wmape_m = wmape(merged["actual"].values, merged["pred"].values)
+            _wk = pred_df.copy()
+            _wk["_week"] = _wk["date"].dt.isocalendar().week.astype(int).values
+            weekly = _wk.groupby("_week", as_index=False).agg(
+                actual=("qty_ea", "sum"), pred=("pred", "sum")
+            )
+            wk_wm = wmape(weekly["actual"].values, weekly["pred"].values) if len(weekly) > 1 else wmape_m
+            p_diag = pred_df[STORE_KEYS + ["date", "product_id", "qty_ea", "pred"]]
+            planning = store_planning_loss_report(
+                p_diag,
+                store_keys=STORE_KEYS,
+                window_days=PLANNING_MATCH_WINDOW_DAYS,
+                qty_rel_tol=PLANNING_QTY_REL_TOL,
+            ).get("planning_window_loss", float("inf"))
+            score = (
+                br_err
+                + PRIOR_TUNE_WMAPE_WEIGHT * wmape_m
+                + PRIOR_TUNE_WEEKLY_WMAPE_WEIGHT * wk_wm
+                + PRIOR_TUNE_PLANNING_WEIGHT * float(planning)
+            )
             if score < best_score - 1e-9 or (
                 abs(score - best_score) <= 1e-9 and br_err < best_br_err
             ):
@@ -1210,8 +1376,8 @@ def tune_prior_hyperparams(
 
     log(
         f"  tuned P(order) blend: lambda={best_lam:.2f}  prior_k={best_k:.2f}  "
-        f"(score=monthly|bias_ratio-1|+{PRIOR_TUNE_DECISION_SMAPE_WEIGHT}*hard_SMAPE "
-        f"→ {best_score:.4f}; monthly |bias_ratio-1| alone → {best_br_err:.4f})"
+        f"(score=|bias|+{PRIOR_TUNE_WMAPE_WEIGHT}*WMAPE+{PRIOR_TUNE_WEEKLY_WMAPE_WEIGHT}*wkWMAPE "
+        f"→ {best_score:.4f}; monthly |bias_ratio| alone → {best_br_err:.4f})"
     )
     return best_lam, best_k
 
@@ -1228,7 +1394,7 @@ def tune_order_prob_threshold(
     reg_backend: str = "sklearn_cpu",
     prob_calibrator: IsotonicRegression | None = None,
 ) -> float:
-    """Pick P(order) cutoff for hard hurdle to minimize |monthly bias_ratio - 1|."""
+    """Pick P(order) cutoff for hard hurdle to minimize monthly |bias_ratio| + WMAPE."""
     X = valid_open[feat_cols].fillna(0.0)
     pr = valid_open["pos_rate_train"].values
     keys = ID_COLS + ["customer_id"]
@@ -1237,12 +1403,12 @@ def tune_order_prob_threshold(
         .sum()
         .rename(columns={"qty_ea": "actual"})
     )
-    taus = [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50]
     best_tau = ORDER_PROB_THRESHOLD
+    best_score = float("inf")
     best_br_err = float("inf")
     best_fire = 0.0
 
-    for tau in taus:
+    for tau in ORDER_PROB_THRESHOLD_GRID:
         pred, p_ord, _ = predict_hurdle(
             clf,
             reg,
@@ -1254,6 +1420,7 @@ def tune_order_prob_threshold(
             reg_backend=reg_backend,
             prob_calibrator=prob_calibrator,
             order_threshold=tau,
+            soft_volume=False,
         )
         pred_df = valid_open[keys].copy()
         pred_df["pred"] = pred
@@ -1262,18 +1429,40 @@ def tune_order_prob_threshold(
         if merged["actual"].sum() <= 0:
             continue
         br = bias_ratio(merged["actual"].values, merged["pred"].values)
-        br_err = abs(br - 1.0)
+        br_err = abs(br)
+        wmape_m = wmape(merged["actual"].values, merged["pred"].values)
+        p_diag = valid_open[STORE_KEYS + ["date", "product_id", "qty_ea"]].copy()
+        p_diag["pred"] = pred
+        planning = store_planning_loss_report(
+            p_diag,
+            store_keys=STORE_KEYS,
+            window_days=PLANNING_MATCH_WINDOW_DAYS,
+            qty_rel_tol=PLANNING_QTY_REL_TOL,
+        ).get("planning_window_loss", float("inf"))
+        score = (
+            br_err
+            + THRESHOLD_TUNE_WMAPE_WEIGHT * wmape_m
+            + THRESHOLD_TUNE_PLANNING_WEIGHT * float(planning)
+        )
+        if br < 0:
+            score += 0.20 * abs(br)
         fire = float((p_ord >= tau).mean())
-        if br_err < best_br_err - 1e-9 or (
-            abs(br_err - best_br_err) <= 1e-9 and fire > best_fire
+        if score < best_score - 1e-9 or (
+            abs(score - best_score) <= 1e-9 and br_err < best_br_err
+        ) or (
+            abs(score - best_score) <= 1e-9
+            and abs(br_err - best_br_err) <= 1e-9
+            and fire > best_fire
         ):
+            best_score = score
             best_br_err = br_err
             best_tau = tau
             best_fire = fire
 
     log(
         f"  tuned ORDER_PROB_THRESHOLD={best_tau:.2f}  "
-        f"(monthly |bias_ratio-1|={best_br_err:.4f}  fire_rate={best_fire:.4f})"
+        f"(score=|bias|+{THRESHOLD_TUNE_WMAPE_WEIGHT}*WMAPE={best_score:.4f}; "
+        f"monthly |bias_ratio|={best_br_err:.4f}  fire_rate={best_fire:.4f})"
     )
     return best_tau
 
@@ -1295,8 +1484,9 @@ def soften_april_first_day_spike(daily_fc: pd.DataFrame) -> tuple[pd.DataFrame, 
     out = daily_fc.copy()
     mask = out["date"] == d0
     out.loc[mask, "qty_ea"] = out.loc[mask, "qty_ea"].astype(np.float64) * scale
-    mu = np.maximum(out.loc[mask, "mu_qty"].astype(np.float64).values, 1e-9)
-    out.loc[mask, "p_order"] = np.clip(out.loc[mask, "qty_ea"].values / mu, 0.0, 1.0)
+    if "mu_qty" in out.columns:
+        mu = np.maximum(out.loc[mask, "mu_qty"].astype(np.float64).values, 1e-9)
+        out.loc[mask, "p_order"] = np.clip(out.loc[mask, "qty_ea"].values / mu, 0.0, 1.0)
     log(
         f"  April 1 spike soften: scale={scale:.4f}  "
         f"(day1 total {d0_total:,.0f} -> {d0_total * scale:,.0f}, peer mean {peer_mean:,.0f})"
@@ -1324,9 +1514,10 @@ def calibrate_april_forecast(
 
     out = daily_fc.copy()
     out["qty_ea"] = out["qty_ea"].astype(np.float64) * scale
-    out["mu_qty"] = out["mu_qty"].astype(np.float64) * scale
-    mu = np.maximum(out["mu_qty"].astype(np.float64).values, 1e-9)
-    out["p_order"] = np.clip(out["qty_ea"].values / mu, 0.0, 1.0)
+    if "mu_qty" in out.columns:
+        out["mu_qty"] = out["mu_qty"].astype(np.float64) * scale
+        mu = np.maximum(out["mu_qty"].astype(np.float64).values, 1e-9)
+        out["p_order"] = np.clip(out["qty_ea"].values / mu, 0.0, 1.0)
     return out, scale, q_raw
 
 
@@ -1530,7 +1721,7 @@ def main() -> int:
         panel[ID_COLS + ["customer_id", "temperature_zone"]].drop_duplicates(ID_COLS),
         encoders,
     )
-    feat_cols = sliding_feature_columns(CATEGORICAL_ENC)
+    feat_cols = sliding_feature_columns(CATEGORICAL_ENC) + CADENCE_FEATURE_COLS
     tuple_priors = tuple_recursive_priors(panel)
 
     train_anchors = anchors_with_horizon_in(
@@ -1552,6 +1743,9 @@ def main() -> int:
         panel, ID_COLS, CATEGORICAL_ENC, static_enc, valid_anchors, closure
     )
     log(f"  train sample rows: {len(train_df):,}  valid sample rows: {len(valid_df):,}")
+
+    train_df = enrich_sliding_cadence(train_df)
+    valid_df = enrich_sliding_cadence(valid_df)
 
     w_train = sample_weights_sliding(train_df)
     X_train = train_df[feat_cols].fillna(0.0)
@@ -1633,10 +1827,51 @@ def main() -> int:
         prob_calibrator=prob_calibrator,
         order_threshold=order_tau,
     )
+    volume_scale = fit_network_volume_scale(float(y_valid.sum()), float(pred_val.sum()))
+    pred_val = pred_val * volume_scale
+    log(
+        f"  March network volume_scale={volume_scale:.4f}  "
+        f"(soft_hurdle={SOFT_HURDLE_VOLUME}, applied to validation + April exports)"
+    )
 
-    log("Validation (regression, daily, hard hurdle):")
+    _dow_tmp = valid_open[["date", "qty_ea"]].copy()
+    _dow_tmp["_pred"] = pred_val
+    _dow_daily = _dow_tmp.groupby("date", as_index=False).agg(
+        actual=("qty_ea", "sum"), pred=("_pred", "sum"),
+    )
+    dow_scales = compute_dow_calibration(
+        _dow_daily["date"], _dow_daily["actual"].values, _dow_daily["pred"].values,
+    )
+    pred_val = pred_val * dow_scales[valid_open["date"].dt.dayofweek.values]
+    log(
+        "  DOW calibration (from daily aggregates): "
+        + "  ".join(f"{DOW_NAMES[d]}={dow_scales[d]:.3f}" for d in range(7))
+    )
+
+    anchor_scales_dict: dict = {}
+    if "anchor_date" in valid_open.columns:
+        for anchor in sorted(valid_open["anchor_date"].unique()):
+            mask = valid_open["anchor_date"] == anchor
+            a = float(y_valid.values[mask].sum())
+            p = float(pred_val[mask].sum())
+            if p > 0 and a > 0:
+                raw = a / p
+                s = 1.0 + ANCHOR_CAL_SHRINKAGE * (raw - 1.0)
+                s = float(np.clip(s, ANCHOR_CAL_CLIP_LO, ANCHOR_CAL_CLIP_HI))
+                anchor_scales_dict[anchor] = s
+                pred_val[mask] *= s
+        log(
+            "  Per-anchor volume calibration (shrinkage="
+            f"{ANCHOR_CAL_SHRINKAGE:.2f}): "
+            + "  ".join(
+                f"{pd.Timestamp(a).date()}={s:.3f}"
+                for a, s in sorted(anchor_scales_dict.items())
+            )
+        )
+
+    log("Validation (regression, daily, hurdle volume forecast):")
     overall = evaluate_reg(
-        f"overall_daily_hard_hurdle (p_order>={ORDER_PROB_THRESHOLD})",
+        f"overall_daily_hurdle (soft={SOFT_HURDLE_VOLUME}, vol_scale={volume_scale:.3f})",
         y_valid.values,
         pred_val,
     )
@@ -1667,11 +1902,38 @@ def main() -> int:
     diag = valid_open[ID_COLS + ["customer_id", "date", "qty_ea"]].copy()
     diag["pred"] = np.clip(pred_val, 0, None)
     diag["p_order"] = p_val
-    diag["mu_qty"] = mu_val
+    _mu_mult = volume_scale * dow_scales[valid_open["date"].dt.dayofweek.values]
+    if anchor_scales_dict and "anchor_date" in valid_open.columns:
+        _anc_mult = np.ones(len(valid_open), dtype=np.float64)
+        for anc, sc in anchor_scales_dict.items():
+            _anc_mult[valid_open["anchor_date"].values == anc] = sc
+        _mu_mult = _mu_mult * _anc_mult
+    diag["mu_qty"] = mu_val * _mu_mult
+    diag.groupby(ID_COLS + ["customer_id", "date"], as_index=False).agg(
+        qty_ea=("qty_ea", "first"), pred=("pred", "mean")
+    ).to_csv(HURDLE_VALIDATION_DAILY, index=False, encoding="utf-8-sig")
 
-    log("Validation (intermittent loss — tuple×month freq + segment volume + qty on order days)...")
+    pred_hard, _, mu_hard = predict_hurdle(
+        clf_val,
+        reg_val,
+        X_valid,
+        valid_open["pos_rate_train"].values,
+        blend_lambda=blend_lam,
+        prior_k=prior_k,
+        clf_backend=clf_b,
+        reg_backend=reg_b,
+        prob_calibrator=prob_calibrator,
+        order_threshold=order_tau,
+        soft_volume=False,
+    )
+    diag_hard = valid_open[ID_COLS + ["customer_id", "date", "qty_ea"]].copy()
+    diag_hard["pred"] = np.clip(pred_hard, 0, None)
+    diag_hard["p_order"] = p_val
+    diag_hard["mu_qty"] = mu_hard
+
+    log("Validation (intermittent loss — hard hurdle decision rule, pre volume scale)...")
     iloss = intermittent_hurdle_loss_report(
-        diag,
+        diag_hard,
         tuple_keys=ID_COLS + ["customer_id"],
         decision_tau=ORDER_PROB_THRESHOLD,
     )
@@ -1812,11 +2074,20 @@ def main() -> int:
         {"metric": "P_order_calibrated_mean", "value": float(p_cal_valid.mean())},
         {"metric": "P_order_raw_mean", "value": float(p_raw_valid.mean())},
         {"metric": "reg_qty_weight_power", "value": float(REG_QTY_WEIGHT_POWER)},
+        {"metric": "soft_hurdle_volume", "value": float(SOFT_HURDLE_VOLUME)},
+        {"metric": "march_volume_scale", "value": float(volume_scale)},
         {"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)},
         {"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)},
         {"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)},
         {"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)},
         {"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)},
+    ]
+    cal_rows += [
+        {"metric": f"dow_scale_{DOW_NAMES[d]}", "value": float(dow_scales[d])} for d in range(7)
+    ]
+    cal_rows += [
+        {"metric": f"anchor_scale_{pd.Timestamp(a).date()}", "value": float(s)}
+        for a, s in sorted(anchor_scales_dict.items())
     ]
     pd.DataFrame(cal_rows).to_csv(
         HURDLE_VALIDATION_OVERALL, index=False, encoding="utf-8-sig"
@@ -1829,6 +2100,7 @@ def main() -> int:
     full_df = build_sliding_samples(
         panel, ID_COLS, CATEGORICAL_ENC, static_enc, full_anchors, closure
     )
+    full_df = enrich_sliding_cadence(full_df)
     w_full = sample_weights_sliding(full_df)
     full_monitor = HurdleTrainMonitor(
         valid_frame=valid_open,
@@ -1866,7 +2138,8 @@ def main() -> int:
         )
 
     def predict_hurdle_batch(batch: pd.DataFrame) -> np.ndarray:
-        b = batch.merge(tuple_priors, on=ID_COLS, how="left")
+        b = enrich_sliding_cadence(batch)
+        b = b.merge(tuple_priors, on=ID_COLS, how="left")
         b["pos_rate_train"] = b["pos_rate_train"].fillna(0.03)
         pred, _, _ = predict_hurdle(
             clf_full,
@@ -1880,11 +2153,11 @@ def main() -> int:
             prob_calibrator=prob_calibrator,
             order_threshold=order_tau,
         )
-        return pred
+        return pred * volume_scale
 
     log("Sliding April forecast (weekly blocks; predictions extend lookback)...")
     april_anchors = anchors_with_horizon_in(FORECAST_START, FORECAST_END)
-    daily_fc = sliding_forecast_period(
+    daily_fc_raw = sliding_forecast_period(
         panel,
         ID_COLS,
         CATEGORICAL_ENC,
@@ -1893,22 +2166,42 @@ def main() -> int:
         predict_hurdle_batch,
         closure,
     )
-    q_apr = mean_network_daily_total(daily_fc)
-    log(f"  April mean daily network total Q_apr={q_apr:,.1f}  (Q_target={q_stats['Q_target']:,.1f})")
+    q_apr_raw = mean_network_daily_total(daily_fc_raw)
+    log(f"  April raw mean daily network total Q_apr={q_apr_raw:,.1f}  (Q_target={q_stats['Q_target']:,.1f})")
 
     name_lookup = panel[
         ID_COLS + ["customer_id", "product_name", "temperature_zone"]
     ].drop_duplicates(ID_COLS)
-    daily_fc = daily_fc.merge(name_lookup, on=ID_COLS, how="left")
-    for path in (
-        HURDLE_APRIL_DAILY_NETWORK,
-        HURDLE_APRIL_DAILY_STORE,
-        HURDLE_APRIL_DAILY_PATTERN,
-    ):
-        write_hurdle_daily_csv(daily_fc, path, name_lookup)
+    daily_fc_raw = daily_fc_raw.merge(name_lookup, on=ID_COLS, how="left")
+
+    daily_net, net_scale, _ = calibrate_april_forecast(
+        daily_fc_raw.copy(), q_stats["Q_target"]
+    )
+    daily_net, spike_scale = soften_april_first_day_spike(daily_net)
+    daily_net = apply_dow_calibration_to_df(daily_net, dow_scales)
+    q_apr = mean_network_daily_total(daily_net)
     log(
-        f"  Wrote April daily (sliding, all tiers identical): {HURDLE_DAILY_PATTERN_CSV}, "
-        f"{HURDLE_DAILY_STORE_CSV}, {HURDLE_DAILY_NETWORK_CSV}"
+        f"  April network-calibrated mean daily total Q_apr={q_apr:,.1f}  "
+        f"(scale={net_scale:.4f}, Apr1 soften={spike_scale:.4f}, DOW-calibrated)"
+    )
+
+    store_targets = compute_store_daily_targets(panel)
+    daily_store, store_cal = calibrate_april_per_store(daily_fc_raw.copy(), store_targets)
+    daily_store, _ = soften_april_first_day_spike(daily_store)
+    daily_store = apply_dow_calibration_to_df(daily_store, dow_scales)
+
+    patterns = compute_tuple_order_patterns(panel)
+    apr_dates = pd.date_range(FORECAST_START, FORECAST_END, freq="D")
+    daily_pattern = pattern_forecast_april(patterns, apr_dates, closure)
+    daily_pattern = daily_pattern.merge(name_lookup, on=ID_COLS, how="left")
+    daily_pattern = apply_dow_calibration_to_df(daily_pattern, dow_scales)
+
+    write_hurdle_daily_csv(daily_net, HURDLE_APRIL_DAILY_NETWORK, name_lookup)
+    write_hurdle_daily_csv(daily_store, HURDLE_APRIL_DAILY_STORE, name_lookup)
+    write_hurdle_daily_csv(daily_pattern, HURDLE_APRIL_DAILY_PATTERN, name_lookup)
+    log(
+        f"  Wrote April daily tiers: {HURDLE_DAILY_NETWORK_CSV} (network-cal), "
+        f"{HURDLE_DAILY_STORE_CSV} (store-cal), {HURDLE_DAILY_PATTERN_CSV} (pattern cadence)"
     )
 
     pd.DataFrame(
@@ -1916,21 +2209,26 @@ def main() -> int:
             {"metric": "Q_Jan", "value": q_stats["Q_Jan"]},
             {"metric": "Q_Mar", "value": q_stats["Q_Mar"]},
             {"metric": "Q_target", "value": q_stats["Q_target"]},
-            {"metric": "Q_apr_sliding", "value": q_apr},
+            {"metric": "Q_apr_raw_sliding", "value": q_apr_raw},
+            {"metric": "Q_apr_network_calibrated", "value": q_apr},
+            {"metric": "april_network_scale", "value": net_scale},
+            {"metric": "april_first_day_spike_scale", "value": spike_scale},
             {"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)},
             {"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)},
             {"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)},
             {"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)},
             {"metric": "P_order_blend_lambda", "value": blend_lam},
             {"metric": "P_order_prior_k", "value": prior_k},
+            {"metric": "ORDER_PROB_THRESHOLD", "value": order_tau},
+            {"metric": "march_volume_scale", "value": volume_scale},
+            {"metric": "soft_hurdle_volume", "value": float(SOFT_HURDLE_VOLUME)},
         ]
+        + [{"metric": f"dow_scale_{DOW_NAMES[d]}", "value": float(dow_scales[d])} for d in range(7)]
     ).to_csv(HURDLE_APRIL_CALIBRATION, index=False, encoding="utf-8-sig")
-    pd.DataFrame(
-        columns=["warehouse", "customer_id", "store", "store_scale", "store_scale_clipped"]
-    ).to_csv(HURDLE_APRIL_STORE_CALIBRATION, index=False, encoding="utf-8-sig")
+    store_cal.to_csv(HURDLE_APRIL_STORE_CALIBRATION, index=False, encoding="utf-8-sig")
 
     monthly_wcp = (
-        daily_fc.groupby(["warehouse", "customer_id", "product_id", "product_name", "temperature_zone"])[
+        daily_net.groupby(["warehouse", "customer_id", "product_id", "product_name", "temperature_zone"])[
             "qty_ea"
         ]
         .sum()
@@ -1942,7 +2240,7 @@ def main() -> int:
     )
 
     monthly_store = (
-        daily_fc.groupby(ID_COLS + ["customer_id", "product_name", "temperature_zone"])["qty_ea"]
+        daily_store.groupby(ID_COLS + ["customer_id", "product_name", "temperature_zone"])["qty_ea"]
         .sum()
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
@@ -1950,7 +2248,7 @@ def main() -> int:
     monthly_store.to_csv(HURDLE_APRIL_MONTHLY_STORE, index=False, encoding="utf-8-sig")
 
     monthly_cp = (
-        daily_fc.groupby(["customer_id", "product_id", "product_name", "temperature_zone"])["qty_ea"]
+        daily_net.groupby(["customer_id", "product_id", "product_name", "temperature_zone"])["qty_ea"]
         .sum()
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
@@ -1958,7 +2256,7 @@ def main() -> int:
     monthly_cp.to_csv(HURDLE_APRIL_MONTHLY_CP, index=False, encoding="utf-8-sig")
 
     monthly_wh = (
-        daily_fc.groupby("warehouse")["qty_ea"]
+        daily_net.groupby("warehouse")["qty_ea"]
         .sum()
         .reset_index()
         .rename(columns={"qty_ea": "predicted_qty_ea_april"})
@@ -1968,7 +2266,7 @@ def main() -> int:
 
     log("Done.")
     log(
-        f"April daily rows: {len(daily_fc):,}  total pred qty_ea: {daily_fc['qty_ea'].sum():,.1f}  "
+        f"April network-cal daily rows: {len(daily_net):,}  total pred qty_ea: {daily_net['qty_ea'].sum():,.1f}  "
         f"mean daily network total: {q_apr:,.1f}"
     )
     return 0

@@ -1,0 +1,18 @@
+{
+  "row_wmape": 1.5209048087051698,
+  "segment_monthly_wmape": 0.4035067361698893,
+  "bias_ratio": -0.0062652636790813355,
+  "strict_daily_wmape": 1.5209048087051698,
+  "planning_window_loss": 1.3832971933624785,
+  "composite_planning_loss": 1.4176990971981511,
+  "matched_volume_rate": 1.0,
+  "line_match_rate": 1.0,
+  "mean_abs_day_slip_matched": NaN,
+  "Q_Jan": 42220.709677419356,
+  "Q_Mar": 37636.96428571428,
+  "Q_target": 39928.83698156682,
+  "mean_daily_pred_march": 37401.15878038412,
+  "mean_daily_actual_march": 37636.96428571428,
+  "n_eval_rows": 1018444,
+  "n_stores": 1442
+}

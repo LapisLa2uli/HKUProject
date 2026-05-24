@@ -20,6 +20,7 @@ BASELINE_VALIDATION_MONTHLY = BASELINE_DIR / "baseline_validation_monthly_actual
 BASELINE_VALIDATION_OVERALL = BASELINE_DIR / "baseline_validation_overall.csv"
 BASELINE_VALIDATION_PER_WAREHOUSE = BASELINE_DIR / "baseline_validation_per_warehouse.csv"
 BASELINE_VALIDATION_PER_CUSTOMER = BASELINE_DIR / "baseline_validation_per_customer.csv"
+BASELINE_VALIDATION_DAILY = BASELINE_DIR / "baseline_validation_daily.csv"
 BASELINE_APRIL_DAILY = BASELINE_DIR / "april_forecast_daily.csv"
 BASELINE_APRIL_MONTHLY_WCP = BASELINE_DIR / "april_forecast_monthly_by_warehouse_customer_product.csv"
 BASELINE_APRIL_MONTHLY_CP = BASELINE_DIR / "april_forecast_monthly_by_customer_product.csv"
@@ -33,6 +34,7 @@ HURDLE_VALIDATION_PER_CUSTOMER = HURDLE_DIR / "hurdle_validation_per_customer.cs
 HURDLE_VALIDATION_CLASSIFIER = HURDLE_DIR / "hurdle_validation_classifier.csv"
 HURDLE_VALIDATION_INTERMITTENT = HURDLE_DIR / "hurdle_validation_intermittent_loss.csv"
 HURDLE_VALIDATION_PLANNING = HURDLE_DIR / "hurdle_validation_planning_loss.csv"
+HURDLE_VALIDATION_DAILY = HURDLE_DIR / "hurdle_validation_daily.csv"
 HURDLE_TRAINING_MONITOR = HURDLE_DIR / "hurdle_training_monitor.csv"
 HURDLE_APRIL_DAILY_PATTERN = HURDLE_DIR / "april_forecast_hurdle_daily_pattern.csv"
 HURDLE_APRIL_DAILY_STORE = HURDLE_DIR / "april_forecast_hurdle_daily_store.csv"
@@ -50,6 +52,7 @@ STORE_REG_VALIDATION_OVERALL = STORE_REG_DIR / "store_regression_validation_over
 STORE_REG_VALIDATION_PER_WAREHOUSE = STORE_REG_DIR / "store_regression_validation_per_warehouse.csv"
 STORE_REG_VALIDATION_PER_CUSTOMER = STORE_REG_DIR / "store_regression_validation_per_customer.csv"
 STORE_REG_VALIDATION_PLANNING = STORE_REG_DIR / "store_regression_validation_planning_loss.csv"
+STORE_REG_VALIDATION_DAILY = STORE_REG_DIR / "store_regression_validation_daily.csv"
 STORE_REG_APRIL_DAILY = STORE_REG_DIR / "april_forecast_store_regression_daily.csv"
 STORE_REG_APRIL_MONTHLY_STORE = STORE_REG_DIR / "april_forecast_store_regression_monthly_by_store_product.csv"
 STORE_REG_APRIL_MONTHLY_WCP = (
@@ -76,6 +79,11 @@ HEATMAP_HIST_HURDLE_STORE_TOP20 = HEATMAPS_DIR / "store_history_april_heatmap_ro
 HEATMAP_HIST_STORE_REG = HEATMAPS_DIR / "store_history_april_heatmap_row_order_store_regression.csv"
 HEATMAP_HIST_STORE_REG_TOP20 = HEATMAPS_DIR / "store_history_april_heatmap_row_order_store_regression_top20.csv"
 
+# Hierarchical / best-forecast validation chart inputs
+HOURLY_CUSTOMER_DIR = REPORTS / "production_granularity" / "hourly_customer"
+BEST_FORECAST_DIR = REPORTS / "best_forecast"
+VALIDATION_GRID_DIR = FIGURES / "validation_grids"
+
 
 def ensure_report_dirs() -> None:
     for d in (
@@ -86,6 +94,7 @@ def ensure_report_dirs() -> None:
         STORE_REG_DIR,
         COMPARISON_DIR,
         HEATMAPS_DIR,
+        VALIDATION_GRID_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True)
 

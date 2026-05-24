@@ -44,6 +44,7 @@ from _report_paths import (
     STORE_REG_VALIDATION_PER_CUSTOMER,
     STORE_REG_VALIDATION_PER_WAREHOUSE,
     STORE_REG_VALIDATION_PLANNING,
+    STORE_REG_VALIDATION_DAILY,
     ensure_report_dirs,
 )
 
@@ -73,6 +74,11 @@ CATEGORICAL_ENC = [f"{c}_enc" for c in CATEGORICAL_RAW]
 
 CALENDAR_COLS = ["dow", "dom", "month", "weekofyear", "is_weekend"]
 CNY_COLS = ["is_cny_window", "is_warehouse_closed", "days_to_cny", "days_from_cny"]
+
+VOLUME_SCALE_CLIP_LO = 0.5
+VOLUME_SCALE_CLIP_HI = 30.0
+DOW_SCALE_CLIP_LO = 0.5
+DOW_SCALE_CLIP_HI = 50.0
 
 
 class RegressorModel(Protocol):
@@ -292,6 +298,9 @@ def feature_columns() -> list[str]:
     return cols
 
 
+TRAIN_STEP_DAYS = 3
+
+
 def fit_model(
     X: np.ndarray,
     y: np.ndarray,
@@ -299,7 +308,10 @@ def fit_model(
     *,
     use_gpu: bool,
 ) -> tuple[Any, str]:
-    return fit_regressor(X, y, sample_weight, use_gpu=use_gpu, num_boost_round=600)
+    return fit_regressor(
+        X, y, sample_weight, use_gpu=use_gpu, num_boost_round=1200,
+        params={"learning_rate": 0.05, "max_depth": 8, "lambda": 0.3, "subsample": 0.8},
+    )
 
 
 def predict_model(model: Any, backend: str, X: np.ndarray) -> np.ndarray:
@@ -313,6 +325,64 @@ def evaluate(name: str, y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, flo
         f"SMAPE={metrics['smape']:.3f}  bias={metrics['bias']:+.3f}"
     )
     return metrics
+
+
+def fit_volume_scale(actual_sum: float, pred_sum: float) -> float:
+    """Global volume calibration factor from March validation."""
+    if pred_sum <= 0 or actual_sum <= 0:
+        return 1.0
+    return float(np.clip(actual_sum / pred_sum, VOLUME_SCALE_CLIP_LO, VOLUME_SCALE_CLIP_HI))
+
+
+def _wom(dates: pd.Series) -> np.ndarray:
+    return np.clip((pd.to_datetime(dates).dt.day.values - 1) // 7 + 1, 1, 5)
+
+
+def fit_wom_dow_calibration(
+    dates: pd.Series, y_true: np.ndarray, y_pred: np.ndarray
+) -> dict[tuple[int, int], float]:
+    """Per (week-of-month, DOW) multiplicative calibration.
+
+    Each group (wom, dow) is one calendar date per month. The factor is
+    actual_sum / pred_sum across all tuples on that specific (wom, dow).
+    Falls back to the overall DOW factor when a (wom, dow) pair is empty.
+    """
+    dates_dt = pd.to_datetime(dates)
+    dow = dates_dt.dt.dayofweek.values
+    wom = _wom(dates)
+
+    dow_cal: dict[int, float] = {}
+    for d in range(7):
+        mask = dow == d
+        a = float(y_true[mask].sum()) if mask.any() else 0.0
+        p = float(y_pred[mask].sum()) if mask.any() else 0.0
+        dow_cal[d] = float(np.clip(a / p, DOW_SCALE_CLIP_LO, DOW_SCALE_CLIP_HI)) if p > 0 else 1.0
+
+    cal: dict[tuple[int, int], float] = {}
+    for w in range(1, 6):
+        for d in range(7):
+            mask = (wom == w) & (dow == d)
+            if not mask.any():
+                cal[(w, d)] = dow_cal[d]
+                continue
+            a = float(y_true[mask].sum())
+            p = float(y_pred[mask].sum())
+            if p <= 0:
+                cal[(w, d)] = dow_cal[d]
+            else:
+                cal[(w, d)] = float(np.clip(a / p, DOW_SCALE_CLIP_LO, DOW_SCALE_CLIP_HI))
+    return cal
+
+
+def apply_wom_dow_calibration(
+    dates: pd.Series, preds: np.ndarray, cal: dict[tuple[int, int], float]
+) -> np.ndarray:
+    """Apply per (WOM, DOW) scaling to predictions."""
+    dates_dt = pd.to_datetime(dates)
+    dow = dates_dt.dt.dayofweek.values
+    wom = _wom(dates)
+    factors = np.array([cal.get((w, d), 1.0) for w, d in zip(wom, dow)], dtype=np.float64)
+    return preds * factors
 
 
 def _lag_roll_from_buffer(masked_buf: np.ndarray, actual_buf: np.ndarray) -> dict[str, np.ndarray]:
@@ -495,15 +565,15 @@ def main() -> int:
     feat_cols = sliding_feature_columns(CATEGORICAL_ENC)
 
     train_anchors = anchors_with_horizon_in(
-        JAN_START, TRAIN_END, step_days=SLIDE_STEP_TRAIN_DAYS
+        JAN_START, TRAIN_END, step_days=TRAIN_STEP_DAYS
     )
     valid_anchors = anchors_with_horizon_in(
         VALID_START, VALID_END, step_days=SLIDE_STEP_TRAIN_DAYS
     )
     log(
         f"Sliding windows: lookback={LOOKBACK_OPEN_DAYS} open days, "
-        f"horizon={HORIZON_DAYS}d, train_step={SLIDE_STEP_TRAIN_DAYS}d, "
-        f"april_step={SLIDE_STEP_DAYS}d"
+        f"horizon={HORIZON_DAYS}d, train_step={TRAIN_STEP_DAYS}d, "
+        f"valid_step={SLIDE_STEP_TRAIN_DAYS}d, april_step={SLIDE_STEP_DAYS}d"
     )
 
     train_df = build_sliding_samples(
@@ -528,11 +598,28 @@ def main() -> int:
     log(f"  train time: {time.perf_counter() - t_train:.1f}s")
     valid_pred = predict_model(model_val, backend, X_valid)
 
-    log("Validation metrics (open days only):")
-    overall = evaluate("overall_daily", y_valid, valid_pred)
+    log("Validation metrics (open days only, raw):")
+    overall_raw = evaluate("overall_daily_raw", y_valid, valid_pred)
+
+    log("Fitting volume calibration from March validation...")
+    volume_scale = fit_volume_scale(float(y_valid.sum()), float(valid_pred.sum()))
+    log(f"  global volume_scale={volume_scale:.4f}")
+
+    wom_dow_cal = fit_wom_dow_calibration(valid_open["date"], y_valid, valid_pred)
+    for (w, d), f in sorted(wom_dow_cal.items()):
+        log(f"  WOM{w} DOW{d} cal={f:.3f}")
+
+    valid_pred_cal = apply_wom_dow_calibration(valid_open["date"], valid_pred, wom_dow_cal)
+    valid_pred_cal = np.clip(valid_pred_cal, 0, None)
+
+    log("Validation metrics (open days only, calibrated WOM×DOW):")
+    overall = evaluate("overall_daily", y_valid, valid_pred_cal)
 
     diag = valid_open[ID_COLS + ["customer_id", "date", "qty_ea"]].copy()
-    diag["pred"] = np.clip(valid_pred, 0, None)
+    diag["pred"] = valid_pred_cal
+    diag.groupby(ID_COLS + ["customer_id", "date"], as_index=False).agg(
+        qty_ea=("qty_ea", "first"), pred=("pred", "mean")
+    ).to_csv(STORE_REG_VALIDATION_DAILY, index=False, encoding="utf-8-sig")
 
     per_wh = (
         diag.groupby("warehouse", observed=True)[["qty_ea", "pred"]]
@@ -595,16 +682,21 @@ def main() -> int:
             {"metric": "planning_strict_daily_wmape", "value": float(ploss.get("strict_daily_wmape", float("nan")))},
             {"metric": "planning_match_window_days", "value": float(PLANNING_MATCH_WINDOW_DAYS)},
         ]
+        + [{"metric": "volume_scale", "value": float(volume_scale)}]
+        + [
+            {"metric": f"wom_dow_cal_{w}_{d}", "value": float(wom_dow_cal[(w, d)])}
+            for w, d in sorted(wom_dow_cal)
+        ]
         + [{"metric": "training_backend_xgboost_cuda", "value": float(use_gpu)}]
         + [{"metric": "sliding_lookback_open_days", "value": float(LOOKBACK_OPEN_DAYS)}]
         + [{"metric": "sliding_horizon_days", "value": float(HORIZON_DAYS)}]
-        + [{"metric": "sliding_step_train_days", "value": float(SLIDE_STEP_TRAIN_DAYS)}]
+        + [{"metric": "sliding_step_train_days", "value": float(TRAIN_STEP_DAYS)}]
         + [{"metric": "sliding_step_april_days", "value": float(SLIDE_STEP_DAYS)}]
     ).to_csv(STORE_REG_VALIDATION_OVERALL, index=False, encoding="utf-8-sig")
 
     log("Retraining on sliding samples through March...")
     full_anchors = anchors_with_horizon_in(
-        JAN_START, HISTORY_END, step_days=SLIDE_STEP_TRAIN_DAYS
+        JAN_START, HISTORY_END, step_days=TRAIN_STEP_DAYS
     )
     full_df = build_sliding_samples(
         panel, ID_COLS, CATEGORICAL_ENC, static_enc, full_anchors, closure
@@ -622,15 +714,21 @@ def main() -> int:
     log("Sliding April forecast...")
     t_rec = time.perf_counter()
     april_anchors = anchors_with_horizon_in(FORECAST_START, FORECAST_END)
+
+    def _predict_april_batch(batch: pd.DataFrame) -> np.ndarray:
+        raw = predict_model(
+            model_full, backend,
+            np.nan_to_num(batch[feat_cols].to_numpy(dtype=np.float64), nan=0.0),
+        )
+        return apply_wom_dow_calibration(batch["date"], raw, wom_dow_cal)
+
     daily_fc = sliding_forecast_period(
         panel,
         ID_COLS,
         CATEGORICAL_ENC,
         static_enc,
         april_anchors,
-        lambda b: predict_model(
-            model_full, backend, np.nan_to_num(b[feat_cols].to_numpy(dtype=np.float64), nan=0.0)
-        ),
+        _predict_april_batch,
         closure,
     )
     log(f"  April forecast total: {time.perf_counter() - t_rec:.1f}s")

@@ -19,10 +19,10 @@ All models use **sliding windows**: 14 warehouse-open lookback days → predict 
 | Baseline bias ratio **before** CNY handling (documented) | -18.70% |
 | Baseline bias ratio **after** CNY handling (current run) | -86.70% |
 | Baseline daily MAE | 30.2143 |
-| Hurdle daily MAE | 1.0541 |
+| Hurdle daily MAE | 1.7034 |
 | Store regression daily MAE | 1.1291 |
 | Baseline March monthly WMAPE | 0.8686 |
-| Hurdle March monthly WMAPE | 0.9840 |
+| Hurdle March monthly WMAPE | 1.0880 |
 | Store regression March monthly WMAPE | 0.8955 |
 
 ## April totals (store regression and hurdle rolled up to warehouse–customer–product)
@@ -30,7 +30,7 @@ All models use **sliding windows**: 14 warehouse-open lookback days → predict 
 | Model | Total predicted qty_ea |
 |-------|------------------------:|
 | Baseline | 374,726 |
-| Hurdle (rolled up) | 24,106 |
+| Hurdle (rolled up) | 807,812 |
 | Store regression (rolled up) | 504,839 |
 
 ## Detail files

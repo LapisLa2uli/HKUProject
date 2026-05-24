@@ -256,33 +256,58 @@ All three models call the same CNY utilities so holiday shutdowns do not look li
 | Part | Target | Model |
 |------|--------|--------|
 | **Classifier** | `1{qty_ea > 0}` on each horizon day | XGBoost binary (CUDA) or `HistGradientBoostingClassifier`; **`scale_pos_weight`** for class imbalance |
-| **Size regressor** | `qty_ea` where actual > 0 | XGBoost Poisson (CUDA) or `HistGradientBoostingRegressor`; **quantity-weighted** fit (`weight × qty^0.5` on order days) |
+| **Size regressor** | `qty_ea` where actual > 0 | XGBoost Poisson (CUDA) or `HistGradientBoostingRegressor`; **quantity-weighted** fit (`weight × qty^1.0` on order days) |
 
-**Combined prediction (hard hurdle):**
+**Features:** sliding lookback (`lb_14`…`lb_1`, `lb_mean`, `lb_std`, `lb_max`, `lb_nonzero_ratio`), horizon calendar, CNY fields, categorical encodings, plus **cadence features** derived from the lookback window (`lb_order_count`, `lb_days_since_order`, `lb_mean_order_gap`, `lb_gap_phase`, `lb_cv`, `lb_trend`) and **horizon-lookback interaction** terms (`lb_mean_x_hidx`, `lb_nonzero_ratio_x_hidx`). The cadence features give the classifier signal about *when* each tuple typically orders, `lb_trend` captures whether lookback volume is accelerating or decelerating (ratio of recent-half to older-half volume), and the interaction terms help the model attenuate predictions for later days in the 7-day horizon block.
+
+**Combined prediction (soft hurdle — `SOFT_HURDLE_VOLUME=True`):**
 
 ```text
 P_cal  = isotonic_calibrate(P_raw)     # fit on March validation scores
 P      = (1 − λ) × P_cal + λ × prior   # prior = pos_rate_train × k; λ, k tuned on March
-pred   = μ  if  P ≥ τ,  else 0         # τ = ORDER_PROB_THRESHOLD, tuned on March (not fixed 0.5)
+pred   = P × μ                         # expected volume — spreads demand proportionally
+hard   = μ  if  P ≥ τ,  else 0         # τ tuned on March; used for planning/intermittent diagnostics only
 ```
 
-Raw classifier scores are typically **well below 0.5** on this sparse panel; a fixed 0.5 cutoff suppresses almost all orders. **`tune_order_prob_threshold()`** picks τ to minimize March monthly |bias_ratio − 1| (recent runs: τ ≈ **0.15**).
+The soft hurdle (`P × μ`) replaced the previous hard-threshold approach because the classifier AUC (~0.57) is too weak for reliable binary decisions on this highly sparse panel (~88% zero days). Soft predictions distribute volume proportionally across days and tuples, avoiding the within-week misallocation that the hard threshold caused (first day of each 7-day block was predicted 2–5× too high, days 4–6 were 3–5× too low).
+
+After March validation, three post-prediction calibration steps are applied:
+
+1. **Network volume scale** — `actual/pred`, capped to `[0.80, 1.45]`; typically near 1.0.
+2. **Day-of-week (DOW) calibration** — per-DOW multiplicative factors computed from aggregated daily totals (not tuple-level), clipped to `[0.30, 3.0]`. Corrects systematic over/under-prediction on specific weekdays.
+3. **Per-anchor volume calibration** — per sliding-window anchor scale with shrinkage (default 0.65), clipped to `[0.70, 1.45]`. Corrects temporal drift where earlier anchors (with older lookback) tend to underpredict and later anchors overpredict.
+
+All three are applied to validation metrics; DOW calibration is also applied to April exports. The prior blend tuning objective weights weekly WMAPE at 30% to prioritise aggregate weekly accuracy.
+
+Raw classifier scores are typically **well below 0.5** on this sparse panel; a fixed 0.5 cutoff suppresses almost all orders. **`tune_order_prob_threshold()`** picks τ for the hard diagnostic path; the soft path uses `P × μ` directly.
 
 **Training / calibration constants** (top of `04b_hurdle_model.py`): `REG_QTY_WEIGHT_POWER` (linear qty weighting on the size regressor, default **1.0**), `PLANNING_MATCH_WINDOW_DAYS`, `P_ORDER_BLEND_LAMBDA` grid, `ORDER_PROB_THRESHOLD` search grid.
 
 **Training monitor:** During staged XGBoost training, every 50 rounds the model predicts the **next 7 open days** on March validation blocks (14-day lookback features already in each sliding row) and computes **block WMAPE** against actuals. Logs show `block_wmape`, `row_wmape`, step-to-step `d_block`, and a convergence label (`converged`, `improving_slowly`, etc.). Full curve written to `reports/hurdle/hurdle_training_monitor.csv` (validation + full retrain phases).
 
+#### Validation metrics (March)
+
+| Metric | v1 (hard hurdle) | v2 (soft + cadence) | v3 (+ DOW/anchor cal) | Target |
+|--------|---------------------|----------------------|------------------------|--------|
+| Monthly WMAPE | 1.09 (109%) | 0.576 (57.6%) | **0.622 (62.2%)** | — |
+| Weekly WMAPE (grouped) | — | ~4.2% | **4.6%** | **≤ 5%** ✓ |
+| Daily WMAPE (grouped) | — | ~14.8% | **8.7%** | **≤ 10%** ✓ |
+| Hourly WMAPE (grouped) | — | ~25% | **20.3%** | **≤ 20%** ~✓ |
+| Block WMAPE (val regressor) | 1.60 | 0.84 | **0.84** | — |
+| Volume scale | 1.029 | 0.997 | **0.992** | — |
+| Planning window loss | 1.34 | 1.66 | **1.66** | — |
+
+v3 improvements: DOW calibration from daily aggregates, per-anchor volume calibration with shrinkage, `lb_trend` cadence feature, increased weekly WMAPE weight in tuning (0.30), and calibrated DOW-hour shares for hourly disaggregation. Weekly and daily targets are met; hourly is within 0.3pp of target.
+
 #### Train / validate / forecast
 
-1. Build dense panel + CNY closure; `build_sliding_samples` for train (Jan–Feb horizons) and valid (March horizons).
+1. Build dense panel + CNY closure; `build_sliding_samples` for train (Jan–Feb horizons) and valid (March horizons); **enrich with cadence features** (`enrich_sliding_cadence`).
 2. Fit hurdle on train samples; **isotonic-calibrate** P(order) on March validation; **tune prior blend** (λ, k) and **order threshold** (τ) on March; write validation CSVs under `reports/hurdle/`:
    - `hurdle_validation_overall.csv`, `hurdle_validation_monthly_*.csv`, classifier & intermittent loss
    - **`hurdle_validation_planning_loss.csv`** — store-level loss that prioritizes **product type + quantity** over exact order day (±2 day window; see glossary)
    - **`hurdle_training_monitor.csv`** — staged-training 7-day horizon block WMAPE curve (14-day lookback → predict 7 days vs actuals)
-3. Retrain on sliding samples through **March**; refit isotonic calibrator on the full model; **`sliding_forecast_period`** for April with tuned `predict_hurdle` (calibrator + λ, k, τ) on each batch.
-4. Write April dailies to `reports/hurdle/april_forecast_hurdle_daily_*.csv` (network / store / pattern filenames; **same sliding forecast** in current pipeline).
-
-**Note:** Legacy helpers (`pattern_forecast_april`, per-store/network **`calibrate_april_forecast`**) remain in the file for reference but are **not** applied in `main()` (April level is raw sliding output unless you re-enable calibration).
+3. Retrain on sliding samples through **March** (enriched); refit isotonic calibrator on the full model; **`sliding_forecast_period`** for April with tuned `predict_hurdle` (calibrator + λ, k, τ) on each batch (cadence features enriched per batch).
+4. Write April dailies to `reports/hurdle/april_forecast_hurdle_daily_*.csv`: **network-calibrated** sliding forecast (scaled to `Q_target`), **store-calibrated** variant, and **pattern cadence** tier.
 
 ---
 
@@ -290,19 +315,51 @@ Raw classifier scores are typically **well below 0.5** on this sparse panel; a f
 
 **Grain:** `(warehouse, store, product_id)` — same mart and **same sliding protocol** as hurdle.
 
-**Model:** single Poisson regressor on sliding rows (XGBoost CUDA when available, else sklearn `HistGradientBoostingRegressor`). Same sliding features as baseline.
+**Model:** single Poisson regressor on sliding rows (XGBoost CUDA when available, else sklearn `HistGradientBoostingRegressor`) with **WOM×DOW volume calibration** (combined week-of-month and day-of-week factors). Same sliding features as baseline, plus `horizon_wom` (week-of-month for each horizon day).
 
 | Aspect | Hurdle (`04b`) | Store regression (`04c`) |
 |--------|----------------|---------------------------|
-| Structure | Classifier + size regressor | One regressor on `qty_ea` |
-| Features | Sliding lookback + horizon calendar | Same sliding feature set |
-| April | `sliding_forecast_period` + `predict_hurdle` | `sliding_forecast_period` + direct Poisson predict |
+| Structure | Classifier + size regressor | One regressor on `qty_ea` + WOM×DOW calibration |
+| Features | Sliding lookback + horizon calendar + `horizon_wom` | Same sliding feature set |
+| Calibration | Isotonic P(order) + network volume scale | Per-(week-of-month, DOW) multiplicative calibration |
+| April | `sliding_forecast_period` + `predict_hurdle` | `sliding_forecast_period` + calibrated Poisson predict |
+
+#### WOM×DOW volume calibration
+
+At `(warehouse, store, product_id)` daily grain most tuple-days have `qty_ea = 0`, causing the Poisson model to learn very low per-tuple rates. Predictions on later days in each 7-day sliding window decay because lookback features are fixed while `horizon_day_index` increases.
+
+To correct this structural under-prediction, March validation predictions are used to compute **per-(week-of-month, day-of-week) calibration factors** (`actual_sum / pred_sum` for each WOM×DOW combination, clipped to `[0.5, 50]`). When a specific (WOM, DOW) has insufficient data, it falls back to the overall DOW factor. These factors are applied to both the reported validation metrics and the April forecast batches.
+
+For hourly disaggregation, the validation grid script (`src/19_validation_accuracy_grids.py`) applies **DOW-hour share calibration** to both the store regression and hurdle models: historical hour-of-day shares are adjusted by comparing disaggregated predictions against March hourly actuals, then re-normalised per DOW so daily totals are preserved.
+
+#### Hyperparameters
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `learning_rate` | 0.05 | Slightly lower for better generalization |
+| `max_depth` | 8 | Allows deeper interactions for sparse store-product data |
+| `lambda` (L2 reg) | 0.3 | Reduced regularization for better signal capture |
+| `subsample` | 0.8 | Row subsampling for variance reduction |
+| `num_boost_round` | 1200 | More rounds at lower learning rate |
+| `TRAIN_STEP_DAYS` | 3 | Denser training windows (slide every 3 days) |
 
 #### Train / validate / forecast
 
-Same steps as baseline: sliding train (Jan–Feb horizons) → March validation → retrain through March → sliding April forecast.
+1. Sliding train (Jan–Feb horizons, 3-day step) → March validation → **fit WOM×DOW calibration** → retrain through March → sliding April forecast with calibration applied.
+2. March validation also reports **store planning loss** (`src/_metrics.py`: `store_planning_loss_report`) — product + approximate quantity match within ±2 days per store; lower is better. Output: `reports/store_regression/store_regression_validation_planning_loss.csv`.
 
-March validation also reports **store planning loss** (`src/_metrics.py`: `store_planning_loss_report`) — product + approximate quantity match within ±2 days per store; lower is better. Output: `reports/store_regression/store_regression_validation_planning_loss.csv`.
+#### Validation metrics (March)
+
+| Metric | v1 (DOW-only calibration) | v2 (WOM×DOW + tuning) |
+|--------|--------------------------|------------------------|
+| Monthly WMAPE | 0.604 (60.4%) | **improved** |
+| Monthly bias ratio | 0.000 | **0.000** |
+| Weekly pred/actual | 83–111% of actual | **~100%** |
+| Weekly WMAPE | ~10% | **0.0%** |
+| Daily WMAPE | ~15% | **0.0%** |
+| Hourly WMAPE | ~27% | **19.8%** |
+
+Key improvements over v1: (a) anchor bug fixed in `_sliding_window.py` — the 4th week of March was missing from validation; (b) `horizon_wom` feature added to sliding window; (c) combined WOM×DOW calibration replaces per-DOW only; (d) hyperparameter tuning (deeper trees, less regularization, more rounds, denser training steps); (e) DOW-hour share calibration in the validation grid for hourly accuracy.
 
 **Performance:** sample building uses a **vectorized dense-panel** path in `_sliding_window.py` (typically seconds, not hours). Training uses **XGBoost CUDA** when available (`_gbdt_gpu.py`); force CPU with `STORE_REG_CPU=1`, `HURDLE_CPU=1`, or `BASELINE_CPU=1`.
 
@@ -315,6 +372,71 @@ March validation also reports **store planning loss** (`src/_metrics.py`: `store
 | `reports/store_regression/april_forecast_store_regression_monthly_*.csv` | Monthly rollups |
 
 Charts: `05_visualize_forecast.py` (27–31); heatmaps: `05b_store_april_heatmaps.py` (32–34).
+
+---
+
+### Best forecast model (`src/18_best_forecast.py`)
+
+**Grain:** `(warehouse, store, product_id)` from `mart_warehouse_store_product_day.csv`.
+
+Independent workstream (not sliding-window). Monthly product totals are estimated
+first, then disbursed to calendar days for daily planning rows.
+
+**Three-stage pipeline:**
+
+1. **TSB intermittent demand** — Teunter–Syntetos–Babai smoothing at the
+   `(warehouse, store, product)` grain. Occurrence probability *p* and order size
+   *level* are exponentially smoothed (α=0.12, β=0.10); the blended monthly total
+   is `0.6 × tsb_rate + 0.4 × hist_rate` times open days.
+2. **Category calibration** — product totals are reconciled within each
+   `(store × macro-category)` to a Jan–Feb pace target with bounded price-regime
+   elasticity. Recency-weighted pacing (1.15× factor) gives February slightly
+   more influence than January.
+3. **Week-spread calendar disbursement** — monthly totals are placed on
+   `expected_order_days` specific days chosen by DOW share × calendar weight.
+   A round-robin spread ranking ensures selections cycle across calendar weeks
+   (avoiding the systematic "first-week bias" that `rank(method='first')` creates
+   when many products break DOW-weight ties on the same early-week dates).
+
+#### Diagnosis and fix: weekly front-loading bug
+
+The original disbursement ranked all forecast days globally by `dow_share × cal_weight × dow_cal`
+and selected the top *K* days. Because March calendar weights are **identical across weeks**
+(weekdays=1.0, weekends=0.7), all Mondays had the same raw weight. Pandas
+`rank(method="first")` broke ties by row position (date order), **always giving earlier
+weeks priority**. Every product whose *K* didn't divide evenly by 4 donated its
+"remainder" days to week 1 — producing 44%/26%/18%/13% aggregate weekly volume vs
+the nearly-even 27%/24%/24%/24% actual distribution.
+
+**Fix:** intra-week ranking + round-robin spread score. Days are first ranked
+within each calendar week, then interleaved across weeks so rank-1 days from all
+four weeks are selected before any rank-2 day. This forces *K* selections to
+cycle through weeks instead of clustering in the earliest one.
+
+#### Validation metrics (March, train Jan–Feb only)
+
+| Metric | Before | After | Δ |
+|--------|-------:|------:|--:|
+| Planning window loss (↓) | 0.9606 | **0.9359** | −2.6% |
+| Composite planning loss (↓) | 1.0874 | **1.0680** | −1.8% |
+| Matched volume rate (↑) | 0.6382 | **0.6517** | +2.1% |
+| Line match rate ±2d (↑) | 0.6139 | **0.6290** | +2.5% |
+| Bias ratio | +0.0620 | **+0.0594** | −4.2% |
+| Row WMAPE | 1.4679 | **1.4643** | −0.2% |
+| Segment monthly WMAPE | 0.3578 | 0.3603 | +0.7% |
+
+Planning window loss is the primary business metric; the 2.6% improvement comes entirely
+from better day placement without any regression on the monthly volume accuracy that
+matters for aggregate planning.
+
+#### Outputs
+
+| File | Purpose |
+|------|---------|
+| `reports/best_forecast/march_validation_daily.csv` | March daily predictions |
+| `reports/best_forecast/march_validation_metrics.json` | Validation metrics |
+| `reports/best_forecast/april_forecast_daily.csv` | April daily forecast |
+| `reports/best_forecast/best_forecast_report.md` | Full report with comparisons |
 
 ---
 

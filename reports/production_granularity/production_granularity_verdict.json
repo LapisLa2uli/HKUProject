@@ -1,16 +1,16 @@
 {
-  "generated_at": "2026-05-22T20:54:32.697094+08:00",
+  "generated_at": "2026-05-24T16:09:45.038946+08:00",
   "parent_model": "selected_tagged_systematic_parent",
-  "parent_category_week_wmape": 0.035964278717383905,
+  "parent_category_week_wmape": 0.03606553160527713,
   "parent_category_week_target_met": true,
   "selected_category_day_model": "category_day_frontload_58_42_00",
-  "category_day_wmape": 0.11198793184273716,
+  "category_day_wmape": 0.1120427348493521,
   "category_day_target_met": false,
   "selected_product_week_model": "product_week_recency_alpha_1.05",
-  "product_week_wmape": 0.11638803611785213,
+  "product_week_wmape": 0.11640113172583656,
   "product_week_target_met": false,
   "selected_product_day_model": "product_day__product_week_recency_alpha_1.05__product_dow_ipf",
-  "product_day_wmape": 0.19300509647680766,
+  "product_day_wmape": 0.1930070730031362,
   "product_day_target_met": false,
   "all_reconciliation_checks_passed": true,
   "production_ready": false,
@@ -39,8 +39,8 @@
       "product_name": "窖香脆卜装-BW",
       "week_of_month": 1,
       "qty_ea": 51901.0,
-      "pred": 47396.037891520864,
-      "abs_error": 4504.962108479136
+      "pred": 47394.83992247776,
+      "abs_error": 4506.16007752224
     },
     {
       "product_reference_group": "other",
@@ -48,8 +48,8 @@
       "product_name": "经典东北定制大米10kg精选-BW",
       "week_of_month": 1,
       "qty_ea": 25565.0,
-      "pred": 22054.058286566556,
-      "abs_error": 3510.9417134334435
+      "pred": 22053.500854336406,
+      "abs_error": 3511.4991456635944
     },
     {
       "product_reference_group": "vegetables",
@@ -75,8 +75,8 @@
       "product_name": "外婆菜74-BW",
       "week_of_month": 1,
       "qty_ea": 18496.0,
-      "pred": 16007.436437654262,
-      "abs_error": 2488.5635623457383
+      "pred": 15994.195537916403,
+      "abs_error": 2501.804462083597
     },
     {
       "product_reference_group": "other",
@@ -93,8 +93,8 @@
       "product_name": "肥膘片嫩-BW",
       "week_of_month": 1,
       "qty_ea": 17470.0,
-      "pred": 15274.749088016215,
-      "abs_error": 2195.250911983785
+      "pred": 15274.36300771578,
+      "abs_error": 2195.6369922842205
     },
     {
       "product_reference_group": "meats",
@@ -111,8 +111,8 @@
       "product_name": "豆干（1KG/包）品-BW",
       "week_of_month": 1,
       "qty_ea": 20532.0,
-      "pred": 18640.19600169774,
-      "abs_error": 1891.8039983022609
+      "pred": 18639.724857299163,
+      "abs_error": 1892.275142700837
     },
     {
       "product_reference_group": "meats",
@@ -138,8 +138,8 @@
       "product_name": "窖香脆卜装-BW",
       "week_of_month": 3,
       "qty_ea": 45665.0,
-      "pred": 47396.037891520864,
-      "abs_error": 1731.037891520864
+      "pred": 47394.83992247776,
+      "abs_error": 1729.8399224777604
     },
     {
       "product_reference_group": "meats",
@@ -156,8 +156,8 @@
       "product_name": "肥膘片嫩-BW",
       "week_of_month": 3,
       "qty_ea": 16730.0,
-      "pred": 15274.749088016215,
-      "abs_error": 1455.250911983785
+      "pred": 15274.36300771578,
+      "abs_error": 1455.6369922842205
     },
     {
       "product_reference_group": "meats",
@@ -174,8 +174,8 @@
       "product_name": "经典东北定制大米10kg精选-BW",
       "week_of_month": 2,
       "qty_ea": 23453.0,
-      "pred": 22054.058286566556,
-      "abs_error": 1398.9417134334435
+      "pred": 22053.500854336406,
+      "abs_error": 1399.4991456635944
     },
     {
       "product_reference_group": "other",
@@ -183,8 +183,8 @@
       "product_name": "豆干（1KG/包）品-BW",
       "week_of_month": 3,
       "qty_ea": 17323.0,
-      "pred": 18640.19600169774,
-      "abs_error": 1317.1960016977391
+      "pred": 18639.724857299163,
+      "abs_error": 1316.724857299163
     },
     {
       "product_reference_group": "meats",
